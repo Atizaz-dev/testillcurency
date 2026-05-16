@@ -1,0 +1,733 @@
+name: Verity PR Auto-Fix
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: verity-pr-auto-fix-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  auto_fix:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install YAML parser
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load Verity config
+        id: cfg
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import yaml
+
+          cfg = yaml.safe_load(Path(".verity/config.yml").read_text()) or {}
+          verity = cfg.get("verity", {}) or {}
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as handle:
+            handle.write(f"project_id={str(verity.get('project_id','')).strip()}\n")
+            handle.write(f"callback_url={str(verity.get('callback_url','')).strip()}\n")
+          PY
+
+      - name: Detect Verity project token
+        id: verity_secret
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+        run: |
+          if [ -n "$VERITY_PROJECT_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve command plan
+        id: plan
+        run: |
+          python scripts/detect_repo_commands.py --merge-config > .verity/resolved_commands.json
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          resolved = json.loads(Path(".verity/resolved_commands.json").read_text())
+          max_attempts = min(int((resolved.get("auto_fix", {}) or {}).get("max_attempts", 3) or 3), 3)
+          has_tests = bool(
+            resolved.get("test_groups", {}).get("unit")
+            or resolved.get("test_groups", {}).get("integration")
+            or resolved.get("test_groups", {}).get("e2e")
+          )
+          risk = (resolved.get("risk", {}) or {}).get("level") or "standard"
+          requires_full_suite = bool((resolved.get("risk", {}) or {}).get("requires_full_suite"))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+            handle.write(f"max_attempts={max_attempts}\n")
+            handle.write(f"has_tests={'true' if has_tests else 'false'}\n")
+            handle.write(f"risk_level={risk}\n")
+            handle.write(f"include_build_initial={'true' if (requires_full_suite or risk == 'full') else 'false'}\n")
+          PY
+
+      - name: Notify Verity - started
+        if: ${{ steps.cfg.outputs.callback_url != '' && steps.verity_secret.outputs.present == 'true' }}
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json
+          import os
+          payload = {
+            "event": "workflow_started",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "pr_number": os.environ.get("PR_NUMBER"),
+            "attempt": 0,
+            "phase": "started"
+          }
+          print(json.dumps(payload))
+          PY
+          curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
+
+      - name: Fail if no tests are configured or detected
+        if: ${{ steps.plan.outputs.has_tests != 'true' }}
+        run: |
+          echo "No runnable test commands detected. Configure .verity/config.yml or repo test scripts." >&2
+          exit 1
+
+      - name: Run setup commands
+        run: |
+          python - <<'PY' > /tmp/verity-setup.txt
+          import json
+          from pathlib import Path
+          resolved = json.loads(Path(".verity/resolved_commands.json").read_text())
+          print("\n".join(resolved.get("setup", []) or []))
+          PY
+          set -euo pipefail
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "::group::setup: $cmd"
+            bash -lc "$cmd"
+            echo "::endgroup::"
+          done < /tmp/verity-setup.txt
+
+      - name: Run suite attempt 0
+        id: suite0
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          BUILD_FLAG=""
+          if [ "${{ steps.plan.outputs.include_build_initial }}" = "true" ]; then
+            BUILD_FLAG="--include-build"
+          fi
+          python scripts/run_verity_suite.py --resolved .verity/resolved_commands.json --log .verity/test-output-attempt0.txt --summary .verity/suite-attempt0.json $BUILD_FLAG
+
+      - name: Evaluate suite attempt 0
+        id: eval0
+        if: always()
+        run: python scripts/evaluate_suite_result.py .verity/suite-attempt0.json
+
+      - name: Determine stop after attempt 0
+        id: gate0
+        if: always()
+        env:
+          VERITY_CODE_CHANGED: "true"
+        run: python scripts/determine_auto_fix_outcome.py .verity/suite-attempt0.json
+
+      - name: Notify Verity - attempt 0
+        if: ${{ always() && steps.cfg.outputs.callback_url != '' && steps.verity_secret.outputs.present == 'true' }}
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ATTEMPT_SUCCESS: ${{ steps.eval0.outputs.success }}
+          FAILURE_REASON: ${{ steps.eval0.outputs.failure_reason }}
+          FAILURE_CATEGORY: ${{ steps.eval0.outputs.failure_category }}
+          FAILURE_PHASE: ${{ steps.eval0.outputs.phase }}
+          STOP_REASON: ${{ steps.gate0.outputs.stop_reason }}
+          GROUPS_RUN: ${{ steps.eval0.outputs.groups_run }}
+          GROUPS_SKIPPED: ${{ steps.eval0.outputs.groups_skipped }}
+          E2E_SKIP_REASON: ${{ steps.eval0.outputs.e2e_skip_reason }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json
+          import os
+          payload = {
+            "event": "workflow_progress",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "pr_number": os.environ.get("PR_NUMBER"),
+            "attempt": 0,
+            "phase": os.environ.get("FAILURE_PHASE") or "completed",
+            "success": os.environ.get("ATTEMPT_SUCCESS") == "true",
+            "failure_reason": os.environ.get("FAILURE_REASON") or None,
+            "failure_category": os.environ.get("FAILURE_CATEGORY") or None,
+            "stop_reason": os.environ.get("STOP_REASON") or None,
+            "groups_run": json.loads(os.environ.get("GROUPS_RUN") or "{}"),
+            "groups_skipped": json.loads(os.environ.get("GROUPS_SKIPPED") or "{}"),
+            "e2e_skip_reason": os.environ.get("E2E_SKIP_REASON") or None,
+          }
+          print(json.dumps(payload))
+          PY
+          curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
+
+      - name: Render Codex fix prompt 1
+        if: ${{ steps.gate0.outputs.should_continue == 'true' && fromJSON(steps.plan.outputs.max_attempts) >= 1 }}
+        run: |
+          cat .github/codex/prompts/pr-auto-fix.md > codex-fix-prompt-1.md
+          echo "" >> codex-fix-prompt-1.md
+          echo "## Runtime inputs" >> codex-fix-prompt-1.md
+          echo "" >> codex-fix-prompt-1.md
+          echo "- PR: #${{ github.event.pull_request.number }}" >> codex-fix-prompt-1.md
+          echo "- Attempt: 1 of ${{ steps.plan.outputs.max_attempts }}" >> codex-fix-prompt-1.md
+          echo "- Branch: ${{ github.event.pull_request.head.ref }}" >> codex-fix-prompt-1.md
+          echo "" >> codex-fix-prompt-1.md
+          echo "## Resolved command plan" >> codex-fix-prompt-1.md
+          echo "" >> codex-fix-prompt-1.md
+          cat .verity/resolved_commands.json >> codex-fix-prompt-1.md
+          echo "" >> codex-fix-prompt-1.md
+          echo "## Failure log" >> codex-fix-prompt-1.md
+          echo "" >> codex-fix-prompt-1.md
+          cat .verity/test-output-attempt0.txt >> codex-fix-prompt-1.md
+
+      - name: Run Codex fix attempt 1
+        id: codex1
+        if: ${{ steps.gate0.outputs.should_continue == 'true' && fromJSON(steps.plan.outputs.max_attempts) >= 1 }}
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          model: ${{ vars.VERITY_CODEX_MODEL != '' && vars.VERITY_CODEX_MODEL || 'gpt-5' }}
+          prompt-file: codex-fix-prompt-1.md
+          output-file: codex-fix-output-1.md
+          safety-strategy: drop-sudo
+          sandbox: workspace-write
+          allow-bots: true
+          allow-bot-users: ${{ vars.VERITY_CODEX_ALLOW_BOT_USERS }}
+          codex-args: '["--full-auto"]'
+
+      - name: Commit and push fix attempt 1
+        id: commit1
+        if: ${{ steps.gate0.outputs.should_continue == 'true' && fromJSON(steps.plan.outputs.max_attempts) >= 1 }}
+        run: |
+          git config user.name "verity-bot"
+          git config user.email "verity-bot@users.noreply.github.com"
+          BEFORE="$(git rev-parse HEAD)"
+          if git diff --quiet; then
+            echo "code_changed=false" >> "$GITHUB_OUTPUT"
+            echo "head_before=$BEFORE" >> "$GITHUB_OUTPUT"
+            echo "head_after=$BEFORE" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git add -A
+          git commit -m "chore(verity): auto-fix PR checks (attempt 1)"
+          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+          AFTER="$(git rev-parse HEAD)"
+          echo "code_changed=true" >> "$GITHUB_OUTPUT"
+          echo "head_before=$BEFORE" >> "$GITHUB_OUTPUT"
+          echo "head_after=$AFTER" >> "$GITHUB_OUTPUT"
+
+      - name: Run suite attempt 1
+        id: suite1
+        if: ${{ steps.commit1.outputs.code_changed == 'true' }}
+        continue-on-error: true
+        run: python scripts/run_verity_suite.py --resolved .verity/resolved_commands.json --log .verity/test-output-attempt1.txt --summary .verity/suite-attempt1.json --include-build
+
+      - name: Evaluate suite attempt 1
+        id: eval1
+        if: ${{ steps.commit1.outputs.code_changed == 'true' }}
+        run: python scripts/evaluate_suite_result.py .verity/suite-attempt1.json
+
+      - name: Determine stop after attempt 1
+        id: gate1
+        if: ${{ always() && (steps.commit1.outputs.code_changed == 'true' || steps.gate0.outputs.should_continue == 'true') }}
+        env:
+          VERITY_CODE_CHANGED: ${{ steps.commit1.outputs.code_changed == 'true' && 'true' || 'false' }}
+        run: |
+          if [ "${{ steps.commit1.outputs.code_changed }}" = "true" ]; then
+            python scripts/determine_auto_fix_outcome.py .verity/suite-attempt1.json .verity/suite-attempt0.json
+          else
+            python scripts/determine_auto_fix_outcome.py .verity/suite-attempt0.json
+          fi
+
+      - name: Notify Verity - attempt 1
+        if: ${{ always() && steps.gate0.outputs.should_continue == 'true' && steps.cfg.outputs.callback_url != '' && steps.verity_secret.outputs.present == 'true' }}
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ATTEMPT_SUCCESS: ${{ steps.commit1.outputs.code_changed == 'true' && steps.eval1.outputs.success || 'false' }}
+          FAILURE_REASON: ${{ steps.commit1.outputs.code_changed == 'true' && steps.eval1.outputs.failure_reason || steps.eval0.outputs.failure_reason }}
+          FAILURE_CATEGORY: ${{ steps.commit1.outputs.code_changed == 'true' && steps.eval1.outputs.failure_category || steps.eval0.outputs.failure_category }}
+          FAILURE_PHASE: ${{ steps.commit1.outputs.code_changed == 'true' && steps.eval1.outputs.phase || steps.eval0.outputs.phase }}
+          STOP_REASON: ${{ steps.gate1.outputs.stop_reason }}
+          GROUPS_RUN: ${{ steps.commit1.outputs.code_changed == 'true' && steps.eval1.outputs.groups_run || steps.eval0.outputs.groups_run }}
+          GROUPS_SKIPPED: ${{ steps.commit1.outputs.code_changed == 'true' && steps.eval1.outputs.groups_skipped || steps.eval0.outputs.groups_skipped }}
+          E2E_SKIP_REASON: ${{ steps.commit1.outputs.code_changed == 'true' && steps.eval1.outputs.e2e_skip_reason || steps.eval0.outputs.e2e_skip_reason }}
+          CODE_CHANGED: ${{ steps.commit1.outputs.code_changed == 'true' && 'true' || 'false' }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json
+          import os
+          payload = {
+            "event": "workflow_progress",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "pr_number": os.environ.get("PR_NUMBER"),
+            "attempt": 1,
+            "phase": os.environ.get("FAILURE_PHASE") or "completed",
+            "success": os.environ.get("ATTEMPT_SUCCESS") == "true",
+            "failure_reason": os.environ.get("FAILURE_REASON") or None,
+            "failure_category": os.environ.get("FAILURE_CATEGORY") or None,
+            "stop_reason": os.environ.get("STOP_REASON") or None,
+            "code_changed": os.environ.get("CODE_CHANGED") == "true",
+            "groups_run": json.loads(os.environ.get("GROUPS_RUN") or "{}"),
+            "groups_skipped": json.loads(os.environ.get("GROUPS_SKIPPED") or "{}"),
+            "e2e_skip_reason": os.environ.get("E2E_SKIP_REASON") or None,
+          }
+          print(json.dumps(payload))
+          PY
+          curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
+
+      - name: Render Codex fix prompt 2
+        if: ${{ steps.gate1.outputs.should_continue == 'true' && fromJSON(steps.plan.outputs.max_attempts) >= 2 }}
+        run: |
+          cat .github/codex/prompts/pr-auto-fix.md > codex-fix-prompt-2.md
+          echo "" >> codex-fix-prompt-2.md
+          echo "## Runtime inputs" >> codex-fix-prompt-2.md
+          echo "" >> codex-fix-prompt-2.md
+          echo "- PR: #${{ github.event.pull_request.number }}" >> codex-fix-prompt-2.md
+          echo "- Attempt: 2 of ${{ steps.plan.outputs.max_attempts }}" >> codex-fix-prompt-2.md
+          echo "- Branch: ${{ github.event.pull_request.head.ref }}" >> codex-fix-prompt-2.md
+          echo "" >> codex-fix-prompt-2.md
+          echo "## Resolved command plan" >> codex-fix-prompt-2.md
+          echo "" >> codex-fix-prompt-2.md
+          cat .verity/resolved_commands.json >> codex-fix-prompt-2.md
+          echo "" >> codex-fix-prompt-2.md
+          echo "## Failure log" >> codex-fix-prompt-2.md
+          echo "" >> codex-fix-prompt-2.md
+          cat .verity/test-output-attempt1.txt >> codex-fix-prompt-2.md
+
+      - name: Run Codex fix attempt 2
+        id: codex2
+        if: ${{ steps.gate1.outputs.should_continue == 'true' && fromJSON(steps.plan.outputs.max_attempts) >= 2 }}
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          model: ${{ vars.VERITY_CODEX_MODEL != '' && vars.VERITY_CODEX_MODEL || 'gpt-5' }}
+          prompt-file: codex-fix-prompt-2.md
+          output-file: codex-fix-output-2.md
+          safety-strategy: drop-sudo
+          sandbox: workspace-write
+          allow-bots: true
+          allow-bot-users: ${{ vars.VERITY_CODEX_ALLOW_BOT_USERS }}
+          codex-args: '["--full-auto"]'
+
+      - name: Commit and push fix attempt 2
+        id: commit2
+        if: ${{ steps.gate1.outputs.should_continue == 'true' && fromJSON(steps.plan.outputs.max_attempts) >= 2 }}
+        run: |
+          git config user.name "verity-bot"
+          git config user.email "verity-bot@users.noreply.github.com"
+          BEFORE="$(git rev-parse HEAD)"
+          if git diff --quiet; then
+            echo "code_changed=false" >> "$GITHUB_OUTPUT"
+            echo "head_before=$BEFORE" >> "$GITHUB_OUTPUT"
+            echo "head_after=$BEFORE" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git add -A
+          git commit -m "chore(verity): auto-fix PR checks (attempt 2)"
+          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+          AFTER="$(git rev-parse HEAD)"
+          echo "code_changed=true" >> "$GITHUB_OUTPUT"
+          echo "head_before=$BEFORE" >> "$GITHUB_OUTPUT"
+          echo "head_after=$AFTER" >> "$GITHUB_OUTPUT"
+
+      - name: Run suite attempt 2
+        id: suite2
+        if: ${{ steps.commit2.outputs.code_changed == 'true' }}
+        continue-on-error: true
+        run: python scripts/run_verity_suite.py --resolved .verity/resolved_commands.json --log .verity/test-output-attempt2.txt --summary .verity/suite-attempt2.json --include-build
+
+      - name: Evaluate suite attempt 2
+        id: eval2
+        if: ${{ steps.commit2.outputs.code_changed == 'true' }}
+        run: python scripts/evaluate_suite_result.py .verity/suite-attempt2.json
+
+      - name: Determine stop after attempt 2
+        id: gate2
+        if: ${{ always() && (steps.commit2.outputs.code_changed == 'true' || steps.gate1.outputs.should_continue == 'true') }}
+        env:
+          VERITY_CODE_CHANGED: ${{ steps.commit2.outputs.code_changed == 'true' && 'true' || 'false' }}
+        run: |
+          if [ "${{ steps.commit2.outputs.code_changed }}" = "true" ]; then
+            python scripts/determine_auto_fix_outcome.py .verity/suite-attempt2.json .verity/suite-attempt1.json
+          else
+            python scripts/determine_auto_fix_outcome.py .verity/suite-attempt1.json
+          fi
+
+      - name: Notify Verity - attempt 2
+        if: ${{ always() && steps.gate1.outputs.should_continue == 'true' && steps.cfg.outputs.callback_url != '' && steps.verity_secret.outputs.present == 'true' }}
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ATTEMPT_SUCCESS: ${{ steps.commit2.outputs.code_changed == 'true' && steps.eval2.outputs.success || 'false' }}
+          FAILURE_REASON: ${{ steps.commit2.outputs.code_changed == 'true' && steps.eval2.outputs.failure_reason || steps.eval1.outputs.failure_reason }}
+          FAILURE_CATEGORY: ${{ steps.commit2.outputs.code_changed == 'true' && steps.eval2.outputs.failure_category || steps.eval1.outputs.failure_category }}
+          FAILURE_PHASE: ${{ steps.commit2.outputs.code_changed == 'true' && steps.eval2.outputs.phase || steps.eval1.outputs.phase }}
+          STOP_REASON: ${{ steps.gate2.outputs.stop_reason }}
+          GROUPS_RUN: ${{ steps.commit2.outputs.code_changed == 'true' && steps.eval2.outputs.groups_run || steps.eval1.outputs.groups_run }}
+          GROUPS_SKIPPED: ${{ steps.commit2.outputs.code_changed == 'true' && steps.eval2.outputs.groups_skipped || steps.eval1.outputs.groups_skipped }}
+          E2E_SKIP_REASON: ${{ steps.commit2.outputs.code_changed == 'true' && steps.eval2.outputs.e2e_skip_reason || steps.eval1.outputs.e2e_skip_reason }}
+          CODE_CHANGED: ${{ steps.commit2.outputs.code_changed == 'true' && 'true' || 'false' }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json
+          import os
+          payload = {
+            "event": "workflow_progress",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "pr_number": os.environ.get("PR_NUMBER"),
+            "attempt": 2,
+            "phase": os.environ.get("FAILURE_PHASE") or "completed",
+            "success": os.environ.get("ATTEMPT_SUCCESS") == "true",
+            "failure_reason": os.environ.get("FAILURE_REASON") or None,
+            "failure_category": os.environ.get("FAILURE_CATEGORY") or None,
+            "stop_reason": os.environ.get("STOP_REASON") or None,
+            "code_changed": os.environ.get("CODE_CHANGED") == "true",
+            "groups_run": json.loads(os.environ.get("GROUPS_RUN") or "{}"),
+            "groups_skipped": json.loads(os.environ.get("GROUPS_SKIPPED") or "{}"),
+            "e2e_skip_reason": os.environ.get("E2E_SKIP_REASON") or None,
+          }
+          print(json.dumps(payload))
+          PY
+          curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
+
+      - name: Render Codex fix prompt 3
+        if: ${{ steps.gate2.outputs.should_continue == 'true' && fromJSON(steps.plan.outputs.max_attempts) >= 3 }}
+        run: |
+          cat .github/codex/prompts/pr-auto-fix.md > codex-fix-prompt-3.md
+          echo "" >> codex-fix-prompt-3.md
+          echo "## Runtime inputs" >> codex-fix-prompt-3.md
+          echo "" >> codex-fix-prompt-3.md
+          echo "- PR: #${{ github.event.pull_request.number }}" >> codex-fix-prompt-3.md
+          echo "- Attempt: 3 of ${{ steps.plan.outputs.max_attempts }}" >> codex-fix-prompt-3.md
+          echo "- Branch: ${{ github.event.pull_request.head.ref }}" >> codex-fix-prompt-3.md
+          echo "" >> codex-fix-prompt-3.md
+          echo "## Resolved command plan" >> codex-fix-prompt-3.md
+          echo "" >> codex-fix-prompt-3.md
+          cat .verity/resolved_commands.json >> codex-fix-prompt-3.md
+          echo "" >> codex-fix-prompt-3.md
+          echo "## Failure log" >> codex-fix-prompt-3.md
+          echo "" >> codex-fix-prompt-3.md
+          cat .verity/test-output-attempt2.txt >> codex-fix-prompt-3.md
+
+      - name: Run Codex fix attempt 3
+        id: codex3
+        if: ${{ steps.gate2.outputs.should_continue == 'true' && fromJSON(steps.plan.outputs.max_attempts) >= 3 }}
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          model: ${{ vars.VERITY_CODEX_MODEL != '' && vars.VERITY_CODEX_MODEL || 'gpt-5' }}
+          prompt-file: codex-fix-prompt-3.md
+          output-file: codex-fix-output-3.md
+          safety-strategy: drop-sudo
+          sandbox: workspace-write
+          allow-bots: true
+          allow-bot-users: ${{ vars.VERITY_CODEX_ALLOW_BOT_USERS }}
+          codex-args: '["--full-auto"]'
+
+      - name: Commit and push fix attempt 3
+        id: commit3
+        if: ${{ steps.gate2.outputs.should_continue == 'true' && fromJSON(steps.plan.outputs.max_attempts) >= 3 }}
+        run: |
+          git config user.name "verity-bot"
+          git config user.email "verity-bot@users.noreply.github.com"
+          BEFORE="$(git rev-parse HEAD)"
+          if git diff --quiet; then
+            echo "code_changed=false" >> "$GITHUB_OUTPUT"
+            echo "head_before=$BEFORE" >> "$GITHUB_OUTPUT"
+            echo "head_after=$BEFORE" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git add -A
+          git commit -m "chore(verity): auto-fix PR checks (attempt 3)"
+          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+          AFTER="$(git rev-parse HEAD)"
+          echo "code_changed=true" >> "$GITHUB_OUTPUT"
+          echo "head_before=$BEFORE" >> "$GITHUB_OUTPUT"
+          echo "head_after=$AFTER" >> "$GITHUB_OUTPUT"
+
+      - name: Run suite attempt 3
+        id: suite3
+        if: ${{ steps.commit3.outputs.code_changed == 'true' }}
+        continue-on-error: true
+        run: python scripts/run_verity_suite.py --resolved .verity/resolved_commands.json --log .verity/test-output-attempt3.txt --summary .verity/suite-attempt3.json --include-build
+
+      - name: Evaluate suite attempt 3
+        id: eval3
+        if: ${{ steps.commit3.outputs.code_changed == 'true' }}
+        run: python scripts/evaluate_suite_result.py .verity/suite-attempt3.json
+
+      - name: Determine final outcome
+        id: final
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          summaries = {
+            0: Path(".verity/suite-attempt0.json"),
+            1: Path(".verity/suite-attempt1.json"),
+            2: Path(".verity/suite-attempt2.json"),
+            3: Path(".verity/suite-attempt3.json"),
+          }
+
+          def load_summary(attempt: int):
+            path = summaries[attempt]
+            return json.loads(path.read_text()) if path.exists() else None
+
+          attempt1_changed = os.environ.get("ATTEMPT1_CHANGED", "false") == "true"
+          attempt2_changed = os.environ.get("ATTEMPT2_CHANGED", "false") == "true"
+          attempt3_changed = os.environ.get("ATTEMPT3_CHANGED", "false") == "true"
+          gate0_continue = os.environ.get("GATE0_CONTINUE") == "true"
+          gate1_continue = os.environ.get("GATE1_CONTINUE") == "true"
+          gate2_continue = os.environ.get("GATE2_CONTINUE") == "true"
+
+          final_attempt = 0
+          final_summary = load_summary(0)
+          stop_reason = os.environ.get("GATE0_STOP") or ""
+
+          if gate0_continue:
+            if not attempt1_changed:
+              final_attempt = 1
+              final_summary = load_summary(0)
+              stop_reason = "no_code_change"
+            else:
+              final_attempt = 1
+              final_summary = load_summary(1)
+              stop_reason = os.environ.get("GATE1_STOP") or str((final_summary or {}).get("stop_reason") or "")
+              if gate1_continue:
+                if not attempt2_changed:
+                  final_attempt = 2
+                  final_summary = load_summary(1)
+                  stop_reason = "no_code_change"
+                else:
+                  final_attempt = 2
+                  final_summary = load_summary(2)
+                  stop_reason = os.environ.get("GATE2_STOP") or str((final_summary or {}).get("stop_reason") or "")
+                  if gate2_continue:
+                    if not attempt3_changed:
+                      final_attempt = 3
+                      final_summary = load_summary(2)
+                      stop_reason = "no_code_change"
+                    else:
+                      final_attempt = 3
+                      final_summary = load_summary(3)
+                      stop_reason = str((final_summary or {}).get("stop_reason") or "")
+
+          if final_summary is None:
+            raise SystemExit("No suite summary found")
+          stop_reason = stop_reason or str(final_summary.get("stop_reason") or "")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+            handle.write(f"success={'true' if bool(final_summary.get('success')) else 'false'}\n")
+            handle.write(f"failure_reason={str(final_summary.get('failure_reason') or '')}\n")
+            handle.write(f"failure_category={str(final_summary.get('failure_category') or '')}\n")
+            handle.write(f"phase={str(final_summary.get('phase') or '')}\n")
+            handle.write(f"attempt={final_attempt}\n")
+            handle.write(f"stop_reason={stop_reason}\n")
+            handle.write(f"groups_run={json.dumps(final_summary.get('groups_run') or {}, separators=(',', ':'))}\n")
+            handle.write(f"groups_skipped={json.dumps(final_summary.get('groups_skipped') or {}, separators=(',', ':'))}\n")
+          PY
+        env:
+          ATTEMPT1_CHANGED: ${{ steps.commit1.outputs.code_changed == 'true' && 'true' || 'false' }}
+          ATTEMPT2_CHANGED: ${{ steps.commit2.outputs.code_changed == 'true' && 'true' || 'false' }}
+          ATTEMPT3_CHANGED: ${{ steps.commit3.outputs.code_changed == 'true' && 'true' || 'false' }}
+          GATE0_CONTINUE: ${{ steps.gate0.outputs.should_continue }}
+          GATE0_STOP: ${{ steps.gate0.outputs.stop_reason }}
+          GATE1_CONTINUE: ${{ steps.gate1.outputs.should_continue }}
+          GATE1_STOP: ${{ steps.gate1.outputs.stop_reason }}
+          GATE2_CONTINUE: ${{ steps.gate2.outputs.should_continue }}
+          GATE2_STOP: ${{ steps.gate2.outputs.stop_reason }}
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verity-pr-auto-fix
+          path: |
+            .verity/resolved_commands.json
+            .verity/test-output-attempt*.txt
+            .verity/suite-attempt*.json
+            codex-fix-prompt-*.md
+            codex-fix-output-*.md
+          if-no-files-found: ignore
+
+      - name: Collect passing E2E spec files
+        id: e2e_specs
+        if: ${{ steps.final.outputs.success == 'true' }}
+        run: |
+          # Discover E2E spec directories from resolved commands
+          specs_json=$(python3 - <<'PY'
+          import json, glob, os
+          from pathlib import Path
+          specs = []
+          # Check resolved_commands.json for e2e config
+          resolved_path = Path(".verity/resolved_commands.json")
+          search_dirs = []
+          if resolved_path.exists():
+            resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
+            e2e_cfg = resolved.get("e2e", {}) or {}
+            # Look for common e2e directories
+            for pattern in ["**/e2e/**/*.spec.ts", "**/e2e/**/*.spec.js", "**/tests/e2e/**/*.spec.ts"]:
+              search_dirs.append(pattern)
+          else:
+            search_dirs = ["**/e2e/**/*.spec.ts", "**/e2e/**/*.spec.js"]
+          for pattern in search_dirs:
+            for path in sorted(glob.glob(pattern, recursive=True)):
+              if "node_modules" in path:
+                continue
+              try:
+                content = open(path, encoding="utf-8").read()
+                if len(content.strip()) > 50:
+                  specs.append({"path": path, "content": content[:50000]})
+              except Exception:
+                pass
+          # Deduplicate by path
+          seen = set()
+          unique = []
+          for s in specs:
+            if s["path"] not in seen:
+              seen.add(s["path"])
+              unique.append(s)
+          print(json.dumps(unique))
+          PY
+          )
+          echo "$specs_json" > /tmp/e2e-spec-files.json
+          count=$(echo "$specs_json" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Collected $count E2E spec file(s) for test case capture"
+
+      - name: Notify Verity - completed
+        if: ${{ always() && steps.cfg.outputs.callback_url != '' && steps.verity_secret.outputs.present == 'true' }}
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          FINAL_SUCCESS: ${{ steps.final.outputs.success }}
+          FAILURE_REASON: ${{ steps.final.outputs.failure_reason }}
+          FAILURE_CATEGORY: ${{ steps.final.outputs.failure_category }}
+          FAILURE_PHASE: ${{ steps.final.outputs.phase }}
+          FINAL_ATTEMPT: ${{ steps.final.outputs.attempt }}
+          STOP_REASON: ${{ steps.final.outputs.stop_reason }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GROUPS_RUN: ${{ steps.final.outputs.groups_run }}
+          GROUPS_SKIPPED: ${{ steps.final.outputs.groups_skipped }}
+          E2E_SPECS_COUNT: ${{ steps.e2e_specs.outputs.count || '0' }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json
+          import os
+          import pathlib
+          payload = {
+            "event": "workflow_completed",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "status": "success" if os.environ.get("FINAL_SUCCESS") == "true" else "failure",
+            "pr_number": os.environ.get("PR_NUMBER"),
+            "attempt": int(os.environ.get("FINAL_ATTEMPT") or "0"),
+            "phase": os.environ.get("FAILURE_PHASE") or None,
+            "failure_reason": os.environ.get("FAILURE_REASON") or None,
+            "failure_category": os.environ.get("FAILURE_CATEGORY") or None,
+            "stop_reason": os.environ.get("STOP_REASON") or None,
+            "groups_run": json.loads(os.environ.get("GROUPS_RUN") or "{}"),
+            "groups_skipped": json.loads(os.environ.get("GROUPS_SKIPPED") or "{}"),
+          }
+          # Include passing E2E spec files for automatic test case capture
+          specs_count = int(os.environ.get("E2E_SPECS_COUNT") or "0")
+          specs_path = pathlib.Path("/tmp/e2e-spec-files.json")
+          if specs_count > 0 and specs_path.exists():
+            try:
+              specs = json.loads(specs_path.read_text(encoding="utf-8"))
+              if specs:
+                payload["e2e_spec_files"] = specs
+            except Exception:
+              pass
+          print(json.dumps(payload))
+          PY
+          curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
+
+      - name: Fail workflow if final suite is red
+        if: ${{ always() && steps.final.outputs.success != 'true' }}
+        run: |
+          echo "PR auto-fix loop did not converge." >&2
+          exit 1
