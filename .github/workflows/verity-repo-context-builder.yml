@@ -1,0 +1,237 @@
+name: Verity Repo Context Builder
+
+on:
+  push:
+    paths:
+      - ".verity/bootstrap.json"
+    branches:
+      - "**"
+  workflow_dispatch:
+    inputs:
+      pr_draft:
+        description: "Create PR as draft (true/false)"
+        required: false
+        default: "false"
+      callback_url:
+        description: "Verity callback URL override (optional)"
+        required: false
+        default: ""
+      verity_project_id:
+        description: "Verity project id override (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: verity-repo-context-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  build_context:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install YAML parser
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load .verity/config.yml
+        id: cfg
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import os
+          from pathlib import Path
+          import yaml
+          cfg = yaml.safe_load(Path(".verity/config.yml").read_text()) or {}
+          verity = cfg.get("verity", {}) or {}
+          callback_override = os.environ.get("VERITY_CALLBACK_OVERRIDE", "").strip()
+          project_override = os.environ.get("VERITY_PROJECT_OVERRIDE", "").strip()
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+            f.write(f"project_id={project_override or str(verity.get('project_id','')).strip()}\n")
+            f.write(f"callback_url={callback_override or str(verity.get('callback_url','')).strip()}\n")
+          PY
+        env:
+          VERITY_CALLBACK_OVERRIDE: ${{ inputs.callback_url }}
+          VERITY_PROJECT_OVERRIDE: ${{ inputs.verity_project_id }}
+
+      - name: Notify Verity - started
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+        run: |
+          if [ -z "$VERITY_PROJECT_TOKEN" ] || [ -z "$VERITY_CALLBACK_URL" ]; then
+            echo "Skipping Verity callback (missing token or callback URL)"
+            exit 0
+          fi
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os
+          payload = {
+            "event": "workflow_started",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}"
+          }
+          print(json.dumps(payload))
+          PY
+            curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
+
+      - name: Detect repo commands
+        run: python scripts/detect_repo_commands.py --merge-config > .verity/repo_context.json
+
+      - name: Apply suggestions to docs/REPO_CONTEXT.md
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, time
+          from pathlib import Path
+
+          ctx = json.loads(Path(".verity/repo_context.json").read_text())
+          def fmt(cmds):
+            return "\n".join([f"- `{c}`" for c in cmds]) if cmds else "_(none detected)_"
+
+          p = Path("docs/REPO_CONTEXT.md")
+          txt = p.read_text()
+
+          txt = txt.replace("__DETECTED_AT__", time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(ctx["detected_at"])))
+          txt = txt.replace("__REPO__", "${{ github.repository }}")
+          txt = txt.replace("main", "${{ github.ref_name }}")
+
+          txt = txt.replace("__SUGGESTED_SETUP__", fmt(ctx.get("setup", [])))
+          txt = txt.replace("__SUGGESTED_TEST__", fmt(ctx.get("test", [])))
+          txt = txt.replace("__SUGGESTED_BUILD__", fmt(ctx.get("build", [])))
+          txt = txt.replace("__SUGGESTED_DEPLOY__", fmt(ctx.get("deploy", [])))
+
+          p.write_text(txt)
+          PY
+
+      - name: Apply suggestions to .verity/config.yml (only if empty)
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json
+          from pathlib import Path
+          import yaml
+
+          cfg_path = Path(".verity/config.yml")
+          cfg = yaml.safe_load(cfg_path.read_text()) or {}
+          commands = cfg.get("commands") or {}
+          ctx = json.loads(Path(".verity/repo_context.json").read_text())
+
+          def is_empty(v):
+            return v is None or v == [] or v == ""
+
+          changed = False
+          for k in ["setup","test","build","deploy"]:
+            if k in commands and not is_empty(commands.get(k)):
+              continue
+            sugg = ctx.get(k, [])
+            if sugg:
+              commands[k] = sugg
+              changed = True
+
+          test_groups = commands.get("test_groups") if isinstance(commands.get("test_groups"), dict) else {}
+          ctx_groups = ctx.get("test_groups", {}) if isinstance(ctx.get("test_groups"), dict) else {}
+          for k in ["unit", "integration", "e2e"]:
+            if not is_empty(test_groups.get(k)):
+              continue
+            sugg = ctx_groups.get(k, [])
+            if sugg:
+              test_groups[k] = sugg
+              changed = True
+          if test_groups:
+            commands["test_groups"] = test_groups
+
+          automation = cfg.get("automation") if isinstance(cfg.get("automation"), dict) else {}
+          if not automation.get("test_auto_fix"):
+            automation["test_auto_fix"] = ctx.get("auto_fix", {})
+            changed = True
+          if not automation.get("e2e"):
+            automation["e2e"] = {
+              "enabled": "auto",
+              "command": ctx_groups.get("e2e", []),
+              "start_command": (ctx.get("e2e", {}) or {}).get("start_command", ""),
+              "base_url": (ctx.get("e2e", {}) or {}).get("base_url", ""),
+              "base_url_env": (ctx.get("e2e", {}) or {}).get("base_url_env", "PLAYWRIGHT_BASE_URL"),
+              "required_env": (ctx.get("e2e", {}) or {}).get("required_env", []),
+            }
+            changed = True
+
+          cfg["commands"] = commands
+          if automation:
+            cfg["automation"] = automation
+          if changed:
+            cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+          PY
+
+      - name: Sync docs context (auto document mode)
+        run: python scripts/sync_repo_docs.py
+
+      - name: Create PR (repo context + suggested commands)
+        id: cpr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ github.token }}
+          commit-message: "chore(verity): initialize repo context and suggested commands"
+          branch: verity/repo-context-${{ github.run_id }}
+          delete-branch: true
+          title: "Verity: initialize repo context"
+          body: |
+            This PR initializes `docs/REPO_CONTEXT.md` and (optionally) fills empty command lists in `.verity/config.yml`
+            using safe heuristics. Review and adjust before enabling automation.
+
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          labels: "verity:agent,verity:bootstrap"
+          draft: ${{ inputs.pr_draft == 'true' }}
+
+      - name: Notify Verity - completed
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          JOB_STATUS: ${{ job.status }}
+          PR_NUMBER: ${{ steps.cpr.outputs.pull-request-number }}
+          PR_URL: ${{ steps.cpr.outputs.pull-request-url }}
+        run: |
+          if [ -z "$VERITY_PROJECT_TOKEN" ] || [ -z "$VERITY_CALLBACK_URL" ]; then
+            echo "Skipping Verity callback (missing token or callback URL)"
+            exit 0
+          fi
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os
+          payload = {
+            "event": "workflow_completed",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "status": os.environ.get("JOB_STATUS"),
+            "pr_number": os.environ.get("PR_NUMBER") or None,
+            "pr_url": os.environ.get("PR_URL") or None
+          }
+          print(json.dumps(payload))
+          PY
+            curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
