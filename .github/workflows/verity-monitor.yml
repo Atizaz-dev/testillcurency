@@ -1,0 +1,243 @@
+name: Verity Monitor (Scheduled)
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      full_auto_mode:
+        description: "Enable auto-dispatch behavior for this run (true/false)"
+        required: false
+        default: "false"
+      dispatch_on_failure:
+        description: "Dispatch codex-dev-cycle when checks fail (true/false)"
+        required: false
+        default: "false"
+      callback_url:
+        description: "Verity callback URL override (optional)"
+        required: false
+        default: ""
+      verity_project_id:
+        description: "Verity project id override (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+  actions: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install YAML parser
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load .verity/config.yml
+        id: cfg
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import os
+          from pathlib import Path
+          import yaml
+          cfg = yaml.safe_load(Path(".verity/config.yml").read_text()) or {}
+          verity = cfg.get("verity", {}) or {}
+          commands = cfg.get("commands", {}) or {}
+          callback_override = os.environ.get("VERITY_CALLBACK_OVERRIDE", "").strip()
+          project_override = os.environ.get("VERITY_PROJECT_OVERRIDE", "").strip()
+
+          def norm_list(v):
+            if v is None: return []
+            if isinstance(v, list): return [str(x) for x in v if str(x).strip()]
+            if isinstance(v, str) and v.strip(): return [v.strip()]
+            return []
+
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+            f.write(f"project_id={project_override or str(verity.get('project_id','')).strip()}\n")
+            f.write(f"callback_url={callback_override or str(verity.get('callback_url','')).strip()}\n")
+            f.write("test_cmds<<EOF\n" + "\n".join(norm_list(commands.get("test"))) + "\nEOF\n")
+          PY
+        env:
+          VERITY_CALLBACK_OVERRIDE: ${{ inputs.callback_url }}
+          VERITY_PROJECT_OVERRIDE: ${{ inputs.verity_project_id }}
+
+      - name: Notify Verity - monitor started
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+        run: |
+          if [ -z "$VERITY_PROJECT_TOKEN" ] || [ -z "$VERITY_CALLBACK_URL" ]; then
+            echo "Skipping Verity callback (missing token or callback URL)"
+            exit 0
+          fi
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os
+          payload = {
+            "event": "workflow_started",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}"
+          }
+          print(json.dumps(payload))
+          PY
+            curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
+
+      - name: Run monitor checks (commands.test)
+        id: monitor_checks
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          : > monitor-test-output.txt
+          if [ -z "${{ steps.cfg.outputs.test_cmds }}" ]; then
+            echo "No commands.test configured in .verity/config.yml" | tee -a monitor-test-output.txt
+            exit 1
+          fi
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "=== RUN: $cmd" | tee -a monitor-test-output.txt
+            bash -lc "$cmd" 2>&1 | tee -a monitor-test-output.txt
+            echo "" | tee -a monitor-test-output.txt
+          done <<< "${{ steps.cfg.outputs.test_cmds }}"
+
+      - name: Flag monitor failure
+        id: failed
+        run: |
+          if [ "${{ steps.monitor_checks.outcome }}" = "success" ]; then
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create/update escalation issue
+        id: escalation
+        if: ${{ steps.failed.outputs.value == 'true' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const marker = '<!-- verity-monitor-issue -->';
+            const title = 'Verity monitor: scheduled checks failing';
+            const runUrl = `https://github.com/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const body = [
+              marker,
+              'Scheduled monitor checks failed.',
+              '',
+              `- Workflow run: ${runUrl}`,
+              '- Action: Review failing tests and dispatch an agent run if needed.',
+              '',
+              'This issue is deduplicated by marker; future failures update this thread.'
+            ].join('\n');
+
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              labels: 'verity:monitor',
+              per_page: 100
+            });
+            const existing = openIssues.find((issue) => String(issue.body || '').includes(marker));
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: existing.number,
+                body: `Monitor run failed again: ${runUrl}`
+              });
+              core.setOutput('issue_number', String(existing.number));
+            } else {
+              const created = await github.rest.issues.create({
+                owner,
+                repo,
+                title,
+                body,
+                labels: ['verity:monitor', 'verity:agent']
+              });
+              core.setOutput('issue_number', String(created.data.number));
+            }
+
+      - name: Optional full-auto dispatch (dev-cycle)
+        if: ${{ steps.failed.outputs.value == 'true' && inputs.full_auto_mode == 'true' && inputs.dispatch_on_failure == 'true' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const defaultBranch = context.payload.repository?.default_branch || context.ref.replace('refs/heads/', '');
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'codex-dev-cycle.yml',
+              ref: defaultBranch,
+              inputs: {
+                issue_number: process.env.ESCALATION_ISSUE || '',
+                user_request: 'Monitor detected failing checks. Triage and propose a minimal fix PR.',
+                callback_url: process.env.CALLBACK_URL || '',
+                verity_project_id: process.env.PROJECT_ID || ''
+              }
+            });
+        env:
+          ESCALATION_ISSUE: ${{ steps.escalation.outputs.issue_number }}
+          CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+
+      - name: Notify Verity - monitor completed
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          JOB_STATUS: ${{ job.status }}
+          MONITOR_FAILED: ${{ steps.failed.outputs.value }}
+          ESCALATION_ISSUE: ${{ steps.escalation.outputs.issue_number }}
+        run: |
+          if [ -z "$VERITY_PROJECT_TOKEN" ] || [ -z "$VERITY_CALLBACK_URL" ]; then
+            echo "Skipping Verity callback (missing token or callback URL)"
+            exit 0
+          fi
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os
+          payload = {
+            "event": "workflow_completed",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "status": os.environ.get("JOB_STATUS"),
+            "monitor_failed": os.environ.get("MONITOR_FAILED") == "true",
+            "escalation_issue_number": os.environ.get("ESCALATION_ISSUE") or None
+          }
+          print(json.dumps(payload))
+          PY
+            curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
+
+      - name: Upload monitor artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verity-monitor
+          path: monitor-test-output.txt
+          if-no-files-found: ignore
