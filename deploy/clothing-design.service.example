@@ -1,0 +1,33 @@
+# Install: sudo cp deploy/clothing-design.service.example /etc/systemd/system/clothing-design.service
+# Edit: User, Group, WorkingDirectory, ExecStart (must match `which node` for your deploy user)
+# Then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now clothing-design
+#   sudo systemctl status clothing-design
+
+[Unit]
+Description=Garment mockup studio (Node)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Match the account that owns /var/www/clothing_design and can read .env
+User=orvoxai26
+Group=orvoxai26
+WorkingDirectory=/var/www/clothing_design
+
+Environment=NODE_ENV=production
+EnvironmentFile=-/var/www/clothing_design/.env
+
+# Run: readlink -f $(which node)   (nvm: use that full path instead of /usr/bin/node)
+ExecStart=/usr/bin/node /var/www/clothing_design/server.js
+
+Restart=on-failure
+RestartSec=5
+
+# Hardening (optional; ensure .env and data dirs are readable by User)
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

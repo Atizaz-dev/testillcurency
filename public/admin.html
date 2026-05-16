@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Admin — Garment mockup studio</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body class="admin-body">
+    <header class="app-header">
+      <div class="app-header-inner admin-header-row">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">◆</span>
+          <div>
+            <h1>Admin dashboard</h1>
+            <p class="tagline">Create accounts, view usage this month, and enable or disable access.</p>
+          </div>
+        </div>
+        <div class="admin-header-actions">
+          <span class="admin-env-badge" id="adminEnvBadge" title="Runtime environment">Env: ...</span>
+          <a class="btn btn-secondary btn-compact" href="/">Back to studio</a>
+          <a class="btn btn-ghost btn-compact" id="adminLogoutBtn" href="/logout">Sign out</a>
+        </div>
+      </div>
+    </header>
+
+    <main class="admin-main">
+      <section class="step-card admin-create-card">
+        <h2 class="simple-card-title">Create account</h2>
+        <p class="simple-card-lead">
+          New users receive sign-in credentials here. They should request access on WhatsApp
+          <strong>+971 56 504 1443</strong> before you create an account.
+        </p>
+        <form id="createUserForm" class="admin-form">
+          <div class="field field-tight">
+            <label for="newUserEmail">Email</label>
+            <input type="email" id="newUserEmail" required autocomplete="off" />
+          </div>
+          <div class="field field-tight">
+            <label for="newUserPassword">Temporary password (min 8 characters)</label>
+            <input type="text" id="newUserPassword" required minlength="8" autocomplete="off" />
+          </div>
+          <button type="submit" class="btn btn-primary">Create user</button>
+          <p id="createUserMsg" class="admin-form-msg" hidden role="status"></p>
+        </form>
+      </section>
+
+      <section class="step-card">
+        <h2 class="simple-card-title">Accounts <span id="adminMonthLabel" class="admin-month-tag"></span></h2>
+        <p id="adminLoadError" class="status error is-hidden" role="alert"></p>
+        <div class="admin-table-wrap">
+          <table class="admin-table" id="adminUserTable">
+            <thead>
+              <tr>
+                <th>Email</th>
+                <th>Role</th>
+                <th>Last login</th>
+                <th title="This calendar month (UTC)">Generated (mo)</th>
+                <th title="This calendar month (UTC)">Downloads (mo)</th>
+                <th>All-time gen</th>
+                <th>All-time dl</th>
+                <th>Subscription</th>
+                <th>Manual access</th>
+                <th>Account</th>
+              </tr>
+            </thead>
+            <tbody id="adminUserTbody"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <script src="auth.js?v=auth-global-6" defer></script>
+    <script src="admin.js?v=auth-global-3" defer></script>
+  </body>
+</html>

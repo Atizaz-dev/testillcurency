@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Garment mockup studio — recolor & export</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="app-header-inner app-header-inner-split">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">◆</span>
+          <div>
+            <h1>Garment mockup studio</h1>
+            <p class="tagline">
+              Upload a garment photo — we mask it and apply your colors. Export catalog WebPs in the browser.
+            </p>
+          </div>
+        </div>
+        <div class="header-account" id="headerAccount" hidden>
+          <span class="header-account-email" id="headerUserEmail"></span>
+          <a class="btn btn-secondary btn-compact" href="/admin.html" id="headerAdminLink" hidden>Admin</a>
+          <a class="btn btn-ghost btn-compact" id="headerLogoutBtn" href="/logout" hidden>Sign out</a>
+        </div>
+      </div>
+    </header>
+
+    <div id="subscriptionStrip" class="subscription-strip" hidden>
+      <div class="subscription-strip-inner">
+        <div id="subscriptionNoSub" class="subscription-block" hidden>
+          <p>
+            <strong>No active subscription.</strong> Pay on Stripe’s hosted page (no return to this app). After
+            payment, an admin enables your access here (e.g. <strong>Admin → +30 days</strong>), unless you later add
+            an optional Stripe webhook to extend access automatically.
+          </p>
+          <a
+            class="btn btn-primary btn-compact"
+            id="subscriptionStripeLink"
+            href="https://buy.stripe.com/14AfZg10w7ZOaxq49gak01c"
+            target="_blank"
+            rel="noopener noreferrer"
+            >Subscribe with Stripe</a
+          >
+          <span class="subscription-days-muted">Days remaining on access: <strong id="subscriptionDaysLeft">0</strong></span>
+        </div>
+        <div id="subscriptionHasSub" class="subscription-block subscription-block-ok" hidden>
+          <p>
+            <strong>Subscription active.</strong> About <strong id="subscriptionDaysActive">0</strong> day(s) left in
+            your access window on this studio. Recurring billing stays in Stripe; this counter is what we’ve enabled for
+            you here.
+          </p>
+        </div>
+        <div id="subscriptionAdminNote" class="subscription-block subscription-block-ok" hidden>
+          <p><strong>Admin</strong> — full access to the studio and admin tools.</p>
+        </div>
+      </div>
+    </div>
+
+    <div id="authGate" class="auth-gate" hidden aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="authGateTitle">
+      <div class="auth-gate-card">
+        <h2 id="authGateTitle" class="auth-gate-title">Sign in</h2>
+        <p id="authGateMessage" class="auth-gate-msg" hidden role="alert"></p>
+        <form id="loginForm" class="auth-form">
+          <div class="field field-tight">
+            <label for="loginEmail">Email</label>
+            <input type="email" id="loginEmail" name="email" autocomplete="username" required />
+          </div>
+          <div class="field field-tight">
+            <label for="loginPassword">Password</label>
+            <div class="password-input-wrap">
+              <input type="password" id="loginPassword" name="password" autocomplete="current-password" required />
+              <button type="button" class="password-toggle-btn" id="loginPasswordToggle" aria-label="Show password">
+                👁
+              </button>
+            </div>
+          </div>
+          <p id="loginError" class="auth-form-error" hidden role="alert"></p>
+          <button type="submit" class="btn btn-primary btn-block">Sign in</button>
+        </form>
+        <div class="auth-signup-hint">
+          <p class="auth-signup-title">Need an account?</p>
+          <p class="auth-signup-text">
+            Send a signup request on WhatsApp:
+            <a class="auth-wa-link" href="https://wa.me/971565041443" target="_blank" rel="noopener noreferrer"
+              >+971 56 504 1443</a
+            >
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div id="subscriptionGate" class="auth-gate" hidden aria-hidden="true" role="dialog" aria-modal="true">
+      <div class="auth-gate-card subscription-gate-card">
+        <h2 class="auth-gate-title">Subscription required</h2>
+        <p class="auth-gate-msg subscription-gate-msg" id="subscriptionGateMsg">
+          Your account does not have an active subscription yet.
+        </p>
+        <p class="auth-signup-text">
+          Access to the studio is enabled only after subscription activation by admin.
+        </p>
+        <a
+          class="btn btn-primary btn-block"
+          id="subscriptionGateStripeLink"
+          href="https://buy.stripe.com/14AfZg10w7ZOaxq49gak01c"
+          target="_blank"
+          rel="noopener noreferrer"
+          >Subscribe with Stripe</a
+        >
+        <a class="btn btn-secondary btn-block" id="subscriptionGateLogoutBtn" href="/logout">
+          Logout and sign in with another account
+        </a>
+        <p class="subscription-days-muted subscription-gate-days">
+          Days remaining on this account: <strong id="subscriptionGateDays">0</strong>
+        </p>
+      </div>
+    </div>
+
+    <div id="appShell" class="app-shell app-shell--locked">
+    <div class="layout">
+      <aside class="panel panel-controls panel-controls-simple">
+        <section class="step-card simple-card">
+          <h2 class="simple-card-title">Garment photo</h2>
+          <ol class="flow-steps" aria-label="How it works">
+            <li><strong>Upload</strong> your photo — we keep the image as-is (e.g. white studio backdrop).</li>
+            <li><strong>We mask</strong> the garment from edges so only fabric recolors; the background stays untouched.</li>
+            <li><strong>Pick colors</strong> below and export — no background removal step.</li>
+          </ol>
+          <p class="simple-card-lead simple-card-lead-tight">
+            Three sample shirts load by default; upload your own or click a thumbnail to switch.
+          </p>
+          <label class="file-pill" for="baseFile">
+            <span class="file-pill-icon" aria-hidden="true">📷</span>
+            <span class="file-pill-text">Upload garment photo</span>
+            <input type="file" id="baseFile" accept="image/*" />
+          </label>
+          <button type="button" class="btn btn-ghost btn-block btn-compact remove-upload-btn" id="removeBaseBtn">
+            Remove garment
+          </button>
+          <div id="baseGallery" class="base-gallery" aria-label="Garment photos this session"></div>
+        </section>
+
+        <section class="step-card simple-card">
+          <h2 class="simple-card-title">Design</h2>
+          <p class="simple-card-lead">
+            Optional print or logo — <strong>one file</strong> for every garment color in your export list. Placement and
+            size are shared; the live preview follows the swatch you’re viewing.
+          </p>
+          <div class="design-slot">
+            <p class="design-slot-label">Artwork</p>
+            <div class="design-upload-toolbar">
+              <label class="file-pill file-pill-secondary file-pill-flex" for="designLightFile">
+                <span class="file-pill-icon" aria-hidden="true">◇</span>
+                <span class="file-pill-text">Upload design</span>
+                <input type="file" id="designLightFile" accept="image/*" />
+              </label>
+              <button
+                type="button"
+                class="btn btn-secondary btn-compact design-remove-btn"
+                id="removeDesignLightBtn"
+                disabled
+                aria-disabled="true"
+                title="Remove artwork"
+              >
+                Remove
+              </button>
+            </div>
+            <p id="designLightMeta" class="design-file-meta is-hidden" aria-live="polite"></p>
+          </div>
+          <label class="design-show-row">
+            <input type="checkbox" id="designShowOnPreview" checked />
+            <span>Show design on live preview</span>
+          </label>
+        </section>
+
+        <section class="step-card simple-card step-card-export-block">
+          <h2 class="simple-card-title">Colors &amp; export</h2>
+          <p class="simple-card-lead simple-card-lead-tight">
+            Pick garment export colors (saved for next visit). Backdrop tweaks are optional — most catalogs stay on pure white.
+          </p>
+          <label class="design-show-row design-show-row-tight">
+            <input type="checkbox" id="pureWhiteProductMode" checked />
+            <span>Catalog product image — exact <code>#FFFFFF</code> only; no shadows, vignette, or edge strips</span>
+          </label>
+          <p id="backdropInactiveHint" class="field-hint compact-label backdrop-inactive-hint" hidden>
+            Backdrop color below is ignored while catalog mode is on (exports use <code>#FFFFFF</code>).
+          </p>
+          <details class="backdrop-details">
+            <summary class="backdrop-details-summary">Backdrop color (optional)</summary>
+            <div class="backdrop-details-body">
+              <p class="field-hint compact-label">
+                Quick presets, or use the picker. Near-white values snap to <code>#FFFFFF</code> for cleaner edges.
+                Applies when catalog mode above is off.
+              </p>
+              <div class="backdrop-preset-row" role="group" aria-label="Backdrop presets">
+                <button type="button" class="btn btn-secondary btn-compact" data-scene-preset="#ffffff">White</button>
+                <button type="button" class="btn btn-secondary btn-compact" data-scene-preset="#f3f4f6">Cool gray</button>
+                <button type="button" class="btn btn-secondary btn-compact" data-scene-preset="#faf7f2">Warm paper</button>
+                <button type="button" class="btn btn-secondary btn-compact" data-scene-preset="#e8dcc8">Sand</button>
+              </div>
+              <div class="field field-tight">
+                <label for="sceneBg">Custom backdrop</label>
+                <input type="color" id="sceneBg" value="#ffffff" title="Backdrop behind the garment" />
+              </div>
+            </div>
+          </details>
+          <label class="design-show-row design-show-row-tight">
+            <input type="checkbox" id="studioPhotorealFinish" checked />
+            <span>Studio photoreal — key light, cotton grain, collar depth, clean mask edge</span>
+          </label>
+          <label class="design-show-row design-show-row-tight">
+            <input type="checkbox" id="contactShadowEnable" checked />
+            <span>Contact shadow — soft grounding on bright backdrops</span>
+          </label>
+          <div class="field field-tight">
+            <label for="contactShadowOpacity"
+              >Shadow strength <span id="contactShadowOpacityVal">17%</span></label
+            >
+            <input type="range" id="contactShadowOpacity" min="6" max="30" value="17" />
+            <p class="field-hint compact-label">
+              Transparent PNGs: blurred silhouette under the garment. JPEG flat-lays: subtle shadow along the lower hem only.
+            </p>
+          </div>
+          <p class="color-current-label compact-label">
+            Preview swatch: <strong id="colorNameDisplay">—</strong>
+          </p>
+          <div id="colorSwatchRow" class="color-swatch-row color-swatch-row-compact" role="group" aria-label="Export colors"></div>
+          <label class="design-show-row design-show-row-tight swatch-group-toggle">
+            <input type="checkbox" id="groupExportSwatches" checked />
+            <span>Group swatches into <strong>light</strong> and <strong>dark</strong> rows</span>
+          </label>
+          <div class="color-bulk-actions color-bulk-actions-triple">
+            <button type="button" class="btn btn-secondary btn-compact" id="selectAllColors">All</button>
+            <button type="button" class="btn btn-secondary btn-compact" id="deselectAllColors">None</button>
+            <button type="button" class="btn btn-secondary btn-compact" id="resetDefaultColors">Defaults</button>
+          </div>
+          <div class="field field-tight add-export-color-block">
+            <span class="add-export-color-label">Add export color</span>
+            <p class="field-hint compact-label custom-color-hint">
+              Pick a color, type a hex (e.g. <code>#1a2b3c</code>), optionally name the swatch, then add — list is remembered next time.
+            </p>
+            <div class="custom-color-picker-row">
+              <input type="color" id="customColor" value="#c94f6b" title="Palette" aria-label="Choose color from palette" />
+              <input
+                type="text"
+                id="customColorHex"
+                class="hex-input"
+                value="#C94F6B"
+                placeholder="#RRGGBB or #RGB"
+                spellcheck="false"
+                autocomplete="off"
+                aria-label="Hex color code"
+              />
+            </div>
+            <div class="field field-tight custom-color-name-row">
+              <label for="customColorName">Swatch name</label>
+              <input
+                type="text"   
+                id="customColorName"
+                placeholder="e.g. Azalea (optional — defaults to Custom #HEX)"
+                spellcheck="true"
+                autocomplete="off"
+                maxlength="80"
+                aria-label="Name for this export swatch"
+              />
+            </div>
+            <button type="button" class="btn btn-secondary btn-block" id="addCustomColor">Add to export list</button>
+          </div>
+          <div class="field field-tight export-identity-field">
+            <label for="exportRootName" class="export-identity-label">Title</label>
+            <input
+              type="text"
+              id="exportRootName"
+              class="export-identity-input"
+              placeholder="Export folder name (required)"
+              spellcheck="false"
+              autocomplete="on"
+              maxlength="120"
+              required
+              aria-required="true"
+              aria-describedby="exportRootNameHint"
+            />
+          </div>
+          <div class="field field-tight export-identity-field">
+            <label for="exportSku" class="export-identity-label">SKU</label>
+            <input
+              type="text"
+              id="exportSku"
+              class="export-identity-input"
+              placeholder="Variant or product SKU (required)"
+              spellcheck="false"
+              autocomplete="on"
+              maxlength="120"
+              required
+              aria-required="true"
+            />
+          </div>
+          <details class="csv-naming-panel">
+            <summary>Name exports from Shopify product CSV</summary>
+            <div class="csv-naming-body">
+              <p class="field-hint compact-label">
+                Upload a Shopify product export (same columns as <code>Handle</code>, <code>Type</code>, <code>Option1 Value</code> for color,
+                <code>Variant SKU</code>). Choose the product, then <strong>Apply names to export fields</strong>: the export folder becomes the
+                handle, and each WebP name is the handle, then that color’s <strong>Variant SKU</strong>, then the swatch name (dash-separated). Variant SKU uses the first size row per color. Your export swatch name must match the CSV color
+                (e.g. <strong>Navy</strong> ↔ Option1 Value Navy). The ZIP download lists all WebPs at the top level of the archive.
+              </p>
+              <input type="file" id="shopifyCsvFile" accept=".csv,text/csv" aria-label="Shopify product CSV file" />
+              <div id="shopifyCsvControls" class="csv-naming-controls" hidden>
+                <div class="field field-tight">
+                  <label for="shopifyCsvProduct">Product</label>
+                  <select id="shopifyCsvProduct" aria-describedby="shopifyCsvPreview"></select>
+                </div>
+                <button type="button" class="btn btn-secondary btn-block" id="shopifyCsvApply">
+                  Apply names to export fields
+                </button>
+                <button type="button" class="btn btn-ghost btn-block" id="shopifyCsvClear">Clear CSV naming</button>
+                <p id="shopifyCsvPreview" class="field-hint compact-label" role="status"></p>
+              </div>
+            </div>
+          </details>
+          <div class="step-actions step-actions-inline">
+            <button type="button" class="btn btn-primary btn-block btn-lg" id="generateBtn">Generate WebPs</button>
+            <button type="button" class="btn btn-secondary btn-block btn-lg" id="downloadZipBtn" disabled>
+              Download ZIP
+            </button>
+            <div class="status-with-loader" aria-live="polite">
+              <span id="appLoader" class="app-loader" aria-hidden="true"></span>
+              <div id="status" class="status" role="status"></div>
+            </div>
+          </div>
+        </section>
+
+        <details class="advanced-panel">
+          <summary>Advanced — fine-tune mask &amp; image quality</summary>
+          <div class="advanced-panel-body">
+            <p class="field-hint advanced-intro">
+              Masking and recoloring run automatically after upload. Use this panel to fix stubborn edges,
+              same-color backgrounds, or to adjust fabric detail and edge cleanup.
+            </p>
+
+            <div class="field field-tight">
+              <label for="maskTolerance">Cutout sensitivity</label>
+              <input type="range" id="maskTolerance" min="8" max="85" value="34" />
+              <p class="field-hint">
+                Higher removes more backdrop. White-on-white flat-lays with soft drop shadows are detected automatically
+                (sharper silhouette + less rim wash). If fabric vanishes, lower sensitivity and
+                <strong>Refresh cutout</strong>.
+              </p>
+            </div>
+            <button type="button" class="btn btn-ghost btn-block" id="rebuildMaskBtn">Refresh cutout from photo</button>
+
+            <details class="rembg-details">
+              <summary>Same-color garment vs background</summary>
+              <p class="field-hint rembg-hint">
+                If the <strong>automatic mask</strong> struggles (e.g. shirt same color as wall), run <strong>rembg</strong>
+                locally and load the PNG here — we only use its alpha as a mask; your original photo stays the base.
+              </p>
+              <pre class="rembg-cmd" tabindex="0">pip install "rembg[cpu]"
+python tools/segment_garment.py your-photo.jpg cutout.png</pre>
+              <label class="file-pill file-pill-secondary file-pill-tight" for="rembgMaskFile">
+                <span class="file-pill-icon" aria-hidden="true">✂️</span>
+                <span class="file-pill-text">Load rembg cutout (PNG)</span>
+                <input type="file" id="rembgMaskFile" accept="image/png,image/webp" />
+              </label>
+              <button type="button" class="btn btn-secondary btn-block btn-compact" id="clearRembgMaskBtn">
+                Use automatic cutout instead
+              </button>
+            </details>
+
+            <div class="mask-refine-block">
+              <h3 class="subhead">Refine mask</h3>
+              <div class="field">
+                <label for="maskEdgeAdjust"
+                  >Grow / shrink <span class="range-val" id="maskEdgeAdjustVal">0</span></label
+                >
+                <input type="range" id="maskEdgeAdjust" min="-10" max="10" value="0" />
+              </div>
+              <div class="field">
+                <label for="maskExtraFeather"
+                  >Extra edge softness <span class="range-val" id="maskExtraFeatherVal">0</span></label
+                >
+                <input type="range" id="maskExtraFeather" min="0" max="3" value="0" step="1" />
+              </div>
+              <div class="field">
+                <label for="maskBrushMode">Paint mask</label>
+                <select id="maskBrushMode" class="select-input">
+                  <option value="off" selected>Off</option>
+                  <option value="add">Include</option>
+                  <option value="remove">Exclude</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="maskBrushSize">Brush <span class="range-val" id="maskBrushSizeVal">42 px</span></label>
+                <input type="range" id="maskBrushSize" min="8" max="140" value="42" />
+              </div>
+              <div class="btn-row-tight">
+                <button type="button" class="btn btn-secondary btn-compact" id="clearMaskPaintBtn">Clear brush</button>
+                <button type="button" class="btn btn-secondary btn-compact" id="resetMaskRefineBtn">Reset mask refine</button>
+              </div>
+            </div>
+
+            <div class="field">
+              <div class="label-row">
+                <label for="texturePreserve">Fabric detail <span class="range-val" id="texturePreserveVal">40%</span></label>
+              </div>
+              <input type="range" id="texturePreserve" min="0" max="55" value="40" />
+            </div>
+            <div class="field">
+              <div class="label-row">
+                <label for="defringeStrength">Edge cleanup <span class="range-val" id="defringeStrengthVal">82%</span></label>
+              </div>
+              <input type="range" id="defringeStrength" min="0" max="100" value="82" />
+            </div>
+            <label class="design-show-row design-show-row-tight">
+              <input type="checkbox" id="multiplyTintRecolor" />
+              <span>Linear multiply tint (white / light shirts) — keeps photo texture &amp; shading like real dye; turn off for colored garments (LAB recolor otherwise).</span>
+            </label>
+            <div class="field">
+              <div class="label-row">
+                <label for="designFabricBlend">Print on fabric <span class="range-val" id="designFabricBlendVal">38%</span></label>
+              </div>
+              <input type="range" id="designFabricBlend" min="0" max="100" value="38" />
+            </div>
+
+            <fieldset class="preview-mode-fieldset">
+              <legend class="fieldset-legend">Preview mode</legend>
+              <div class="radio-stack">
+                <label class="radio-card">
+                  <input type="radio" name="previewMode" value="recolor" checked />
+                  <span class="radio-card-body">
+                    <strong>Recolor</strong>
+                    <span class="radio-sub">Final look</span>
+                  </span>
+                </label>
+                <label class="radio-card">
+                  <input type="radio" name="previewMode" value="neutral" />
+                  <span class="radio-card-body">
+                    <strong>Neutral</strong>
+                    <span class="radio-sub">Check mask</span>
+                  </span>
+                </label>
+                <label class="radio-card">
+                  <input type="radio" name="previewMode" value="original" />
+                  <span class="radio-card-body">
+                    <strong>Original</strong>
+                    <span class="radio-sub">Photo + artwork</span>
+                  </span>
+                </label>
+              </div>
+            </fieldset>
+          </div>
+        </details>
+      </aside>
+
+      <main class="preview-wrap">
+        <div class="preview-card">
+          <div id="previewBusyOverlay" class="preview-busy-overlay" hidden aria-hidden="true">
+            <div class="preview-busy-card">
+              <span class="app-loader app-loader-lg" aria-hidden="true"></span>
+              <p class="preview-busy-label" id="previewBusyLabel">Working…</p>
+            </div>
+          </div>
+          <div class="preview-toolbar">
+            <span class="preview-title">Live preview</span>
+            <div class="preview-toolbar-right">
+              <div id="previewDesignActions" class="preview-design-actions" hidden>
+                <button type="button" class="btn btn-ghost btn-compact" id="toggleDesignOverlayBtn">
+                  Hide design
+                </button>
+                <button type="button" class="btn btn-ghost btn-compact" id="removeAllDesignsBtn">
+                  Remove artwork
+                </button>
+              </div>
+              <span class="preview-badge" id="previewToolbarHint">Masked garment · colors follow the selected swatch</span>
+            </div>
+          </div>
+          <div class="canvas-shell">
+            <div class="preview-stage">
+              <div class="canvas-stack">
+                <canvas id="previewCanvas" width="800" height="800"></canvas>
+                <canvas
+                  id="maskPaintOverlay"
+                  class="mask-paint-overlay"
+                  width="800"
+                  height="800"
+                  aria-hidden="true"
+                ></canvas>
+              </div>
+            </div>
+          </div>
+          <div class="design-sliders">
+            <div class="field">
+              <label><span>Design size</span> <span id="scaleVal">35%</span></label>
+              <input type="range" id="designScale" min="8" max="100" value="35" />
+            </div>
+            <div class="field">
+              <label><span>Rotation</span> <span id="rotVal">0°</span></label>
+              <input type="range" id="designRot" min="-180" max="180" value="0" />
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <aside class="panel panel-export">
+        <section class="step-card step-card-flat">
+          <div class="step-head">
+            <span class="step-num muted-num">⬇</span>
+            <h2>Your files</h2>
+          </div>
+          <p class="step-lead">
+            After Generate, use <strong>Edit</strong> on any row to rename folders or files, then download one file or the
+            whole ZIP.
+          </p>
+          <div id="folderTree" class="folder-tree">
+            <p class="empty-state">
+              Nothing yet. Upload a garment photo — we mask and recolor it — then choose colors and
+              <strong>Generate WebPs</strong>.
+            </p>
+          </div>
+        </section>
+      </aside>
+    </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js" defer></script>
+    <script src="auth.js?v=auth-global-6" defer></script>
+    <script src="app.js?v=prod-blob-2" defer></script>
+  </body>
+</html>

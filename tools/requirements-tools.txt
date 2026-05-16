@@ -1,0 +1,7 @@
+# Optional: background removal for same-hue garment vs backdrop (red-on-red, etc.)
+# pip install -r tools/requirements-tools.txt
+rembg>=2.0.50
+onnxruntime>=1.16.0
+# strip_garment_print.py (remove chest print for test assets)
+numpy>=1.24.0
+opencv-python-headless>=4.8.0

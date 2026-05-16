@@ -1,0 +1,60 @@
+# Copy to /etc/nginx/sites-available/clothing-design (adjust paths, user, ports).
+# Test: sudo nginx -t && sudo systemctl reload nginx
+#
+# Before you have a domain + TLS: use the first server{} (port 8888) so you can open
+#   http://YOUR_VPS_IP:8888
+# After DNS points here: enable the second server{} (80 redirect + 443 TLS), get certs with certbot.
+
+# --- Stage A: no domain yet (pick a port not used on your host; 8888 is often free) ---
+server {
+    listen 8888;
+    listen [::]:8888;
+    server_name _;
+
+    gzip on;
+    gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+    gzip_min_length 256;
+
+    location / {
+        # Direct proxy (avoid upstream keepalive + Connection headers — those can cause 502 with Express)
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+    }
+}
+
+# --- Stage B: after DNS for studio.example.com points to this server ---
+# 1) sudo apt install certbot python3-certbot-nginx
+# 2) Uncomment below, replace studio.example.com, run: sudo certbot --nginx -d studio.example.com
+#
+# server {
+#     listen 80;
+#     listen [::]:80;
+#     server_name studio.example.com;
+#     return 301 https://$host$request_uri;
+# }
+#
+# server {
+#     listen 443 ssl http2;
+#     listen [::]:443 ssl http2;
+#     server_name studio.example.com;
+#
+#     ssl_certificate     /etc/letsencrypt/live/studio.example.com/fullchain.pem;
+#     ssl_certificate_key /etc/letsencrypt/live/studio.example.com/privkey.pem;
+#     include /etc/letsencrypt/options-ssl-nginx.conf;
+#     ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+#
+#     location / {
+#         proxy_pass http://127.0.0.1:3000;
+#         proxy_http_version 1.1;
+#         proxy_set_header Host $host;
+#         proxy_set_header X-Real-IP $remote_addr;
+#         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+#         proxy_set_header X-Forwarded-Proto $scheme;
+#         proxy_read_timeout 120s;
+#     }
+# }
