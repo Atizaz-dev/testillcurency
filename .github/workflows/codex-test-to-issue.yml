@@ -1,0 +1,219 @@
+name: Verity Codex Test Failure -> Issue
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit SHA (optional)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Do not create issue, only generate issue.json (true/false)"
+        required: false
+        default: "false"
+      callback_url:
+        description: "Verity callback URL override (optional)"
+        required: false
+        default: ""
+      verity_project_id:
+        description: "Verity project id override (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.sha != '' && inputs.sha || github.sha }}
+
+      - name: Verify required secrets
+        run: |
+          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
+            echo "Missing required secret OPENAI_API_KEY" >&2
+            exit 1
+          fi
+          if [ -z "${{ secrets.VERITY_PROJECT_TOKEN }}" ]; then
+            echo "Missing required secret VERITY_PROJECT_TOKEN" >&2
+            exit 1
+          fi
+
+      - name: Detect GitHub App write-token config
+        id: gh_write_cfg
+        env:
+          VERITY_GITHUB_APP_ID: ${{ secrets.VERITY_GITHUB_APP_ID }}
+          VERITY_GITHUB_APP_PRIVATE_KEY: ${{ secrets.VERITY_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          if [ -n "$VERITY_GITHUB_APP_ID" ] && [ -n "$VERITY_GITHUB_APP_PRIVATE_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve GitHub write token (optional GitHub App)
+        id: gh_write_token
+        if: ${{ steps.gh_write_cfg.outputs.enabled == 'true' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.VERITY_GITHUB_APP_ID }}
+          private-key: ${{ secrets.VERITY_GITHUB_APP_PRIVATE_KEY }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install YAML parser
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load .verity/config.yml
+        id: cfg
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import os
+          from pathlib import Path
+          import yaml
+          cfg = yaml.safe_load(Path(".verity/config.yml").read_text()) or {}
+          verity = cfg.get("verity", {}) or {}
+          commands = cfg.get("commands", {}) or {}
+          callback_override = os.environ.get("VERITY_CALLBACK_OVERRIDE", "").strip()
+          project_override = os.environ.get("VERITY_PROJECT_OVERRIDE", "").strip()
+          def norm_list(v):
+            if v is None: return []
+            if isinstance(v, list): return [str(x) for x in v if str(x).strip()]
+            if isinstance(v, str) and v.strip(): return [v.strip()]
+            return []
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+            f.write(f"project_id={project_override or str(verity.get('project_id','')).strip()}\n")
+            f.write(f"callback_url={callback_override or str(verity.get('callback_url','')).strip()}\n")
+            f.write("test_cmds<<EOF\n" + "\n".join(norm_list(commands.get("test"))) + "\nEOF\n")
+          PY
+        env:
+          VERITY_CALLBACK_OVERRIDE: ${{ inputs.callback_url }}
+          VERITY_PROJECT_OVERRIDE: ${{ inputs.verity_project_id }}
+
+      - name: Notify Verity - started
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os
+          payload = {
+            "event": "workflow_started",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}"
+          }
+          print(json.dumps(payload))
+          PY
+            curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
+
+      - name: Re-run tests and capture output
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          : > test-output.txt
+          if [ -z "${{ steps.cfg.outputs.test_cmds }}" ]; then
+            echo "No commands.test configured in .verity/config.yml" | tee -a test-output.txt
+            exit 1
+          fi
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "=== RUN: $cmd" | tee -a test-output.txt
+            bash -lc "$cmd" 2>&1 | tee -a test-output.txt
+            echo "" | tee -a test-output.txt
+          done <<< "${{ steps.cfg.outputs.test_cmds }}"
+
+      - name: Run Codex (generate issue.json)
+        id: run_codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          model: ${{ vars.VERITY_CODEX_MODEL != '' && vars.VERITY_CODEX_MODEL || 'gpt-5' }}
+          prompt-file: .github/codex/prompts/test-to-issue.md
+          output-file: issue.json
+          safety-strategy: drop-sudo
+          sandbox: workspace-write
+          allow-bots: true
+          codex-args: '["--full-auto","--output-schema",".github/codex/schemas/issue.schema.json"]'
+
+      - name: Create issue
+        id: create_issue
+        if: ${{ inputs.dry_run != 'true' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.gh_write_token.outputs.token || secrets.VERITY_GITHUB_WRITE_TOKEN || github.token }}
+          script: |
+            const fs = require("fs");
+            const issue = JSON.parse(fs.readFileSync("issue.json","utf8"));
+            const created = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: issue.title,
+              body: issue.body,
+              labels: issue.labels,
+            });
+            core.setOutput('issue_number', String(created.data.number));
+            core.setOutput('issue_url', created.data.html_url);
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verity-test-to-issue
+          path: |
+            test-output.txt
+            issue.json
+          if-no-files-found: ignore
+
+      - name: Notify Verity - completed
+        if: always()
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          JOB_STATUS: ${{ job.status }}
+          ISSUE_NUMBER: ${{ steps.create_issue.outputs.issue_number }}
+          ISSUE_URL: ${{ steps.create_issue.outputs.issue_url }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os
+          payload = {
+            "event": "workflow_completed",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "status": os.environ.get("JOB_STATUS"),
+            "dry_run": os.environ.get("DRY_RUN") == "true",
+            "created_issue_number": os.environ.get("ISSUE_NUMBER") or None,
+            "created_issue_url": os.environ.get("ISSUE_URL") or None
+          }
+          print(json.dumps(payload))
+          PY
+            curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
