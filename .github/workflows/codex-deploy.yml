@@ -1,0 +1,281 @@
+name: Verity Deploy (AWS backend + Vercel frontend)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "GitHub Environment name (e.g. staging, production). Controls approvals."
+        required: true
+        default: "staging"
+      deploy_backend:
+        description: "Deploy backend (true/false)"
+        required: false
+        default: "true"
+      deploy_frontend:
+        description: "Deploy frontend (true/false)"
+        required: false
+        default: "true"
+      ref:
+        description: "Git ref (branch/tag/SHA). If empty, uses default branch HEAD."
+        required: false
+        default: ""
+      callback_url:
+        description: "Verity callback URL override (optional)"
+        required: false
+        default: ""
+      verity_project_id:
+        description: "Verity project id override (optional)"
+        required: false
+        default: ""
+      enable_deploy:
+        description: "Explicit deploy policy acknowledgment (true/false)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref != '' && inputs.ref || github.sha }}
+
+      - name: Verify required secrets
+        run: |
+          if [ -z "${{ secrets.VERITY_PROJECT_TOKEN }}" ]; then
+            echo "Missing required secret VERITY_PROJECT_TOKEN" >&2
+            exit 1
+          fi
+          if [ "${{ inputs.deploy_frontend }}" = "true" ]; then
+            if [ -z "${{ secrets.VERCEL_TOKEN }}" ] || [ -z "${{ secrets.VERCEL_ORG_ID }}" ] || [ -z "${{ secrets.VERCEL_PROJECT_ID }}" ]; then
+              echo "Missing Vercel secrets: VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID" >&2
+              exit 1
+            fi
+          fi
+          if [ "${{ inputs.deploy_backend }}" = "true" ]; then
+            if [ -z "${{ secrets.AWS_REGION }}" ]; then
+              echo "Missing AWS_REGION" >&2
+              exit 1
+            fi
+            if [ -z "${{ secrets.AWS_ROLE_TO_ASSUME }}" ]; then
+              if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ] || [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+                echo "Missing AWS auth: AWS_ROLE_TO_ASSUME (OIDC) OR AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY" >&2
+                exit 1
+              fi
+            fi
+          fi
+
+      - name: Set up Python
+        if: ${{ inputs.deploy_backend == 'true' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        if: ${{ inputs.deploy_frontend == 'true' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install YAML parser
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load .verity/config.yml
+        id: cfg
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import os
+          from pathlib import Path
+          import yaml
+          cfg = yaml.safe_load(Path(".verity/config.yml").read_text()) or {}
+          verity = cfg.get("verity", {}) or {}
+          commands = cfg.get("commands", {}) or {}
+          policies = cfg.get("policies", {}) or {}
+          callback_override = os.environ.get("VERITY_CALLBACK_OVERRIDE", "").strip()
+          project_override = os.environ.get("VERITY_PROJECT_OVERRIDE", "").strip()
+          def norm_list(v):
+            if v is None: return []
+            if isinstance(v, list): return [str(x) for x in v if str(x).strip()]
+            if isinstance(v, str) and v.strip(): return [v.strip()]
+            return []
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+            f.write(f"project_id={project_override or str(verity.get('project_id','')).strip()}\n")
+            f.write(f"callback_url={callback_override or str(verity.get('callback_url','')).strip()}\n")
+            f.write("deploy_cmds<<EOF\n" + "\n".join(norm_list(commands.get('deploy'))) + "\nEOF\n")
+            f.write(f"deploy_policy_enabled={bool((policies.get('deploy', {}) or {}).get('enabled', False))}\n")
+          PY
+        env:
+          VERITY_CALLBACK_OVERRIDE: ${{ inputs.callback_url }}
+          VERITY_PROJECT_OVERRIDE: ${{ inputs.verity_project_id }}
+
+      - name: Enforce explicit deploy policy
+        env:
+          CONFIG_POLICY_ENABLED: ${{ steps.cfg.outputs.deploy_policy_enabled }}
+          INPUT_POLICY_ENABLED: ${{ inputs.enable_deploy }}
+          VAR_POLICY_ENABLED: ${{ vars.VERITY_ENABLE_DEPLOY }}
+        run: |
+          normalize() {
+            val="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+            if [ "$val" = "1" ] || [ "$val" = "true" ] || [ "$val" = "yes" ] || [ "$val" = "on" ]; then
+              echo "true"
+            else
+              echo "false"
+            fi
+          }
+
+          config_enabled="$(normalize "$CONFIG_POLICY_ENABLED")"
+          input_enabled="$(normalize "$INPUT_POLICY_ENABLED")"
+          var_enabled="$(normalize "$VAR_POLICY_ENABLED")"
+
+          if [ "$config_enabled" != "true" ] && [ "$input_enabled" != "true" ] && [ "$var_enabled" != "true" ]; then
+            echo "Deploy blocked: enable policies.deploy.enabled in .verity/config.yml, or set input enable_deploy=true, or set repo variable VERITY_ENABLE_DEPLOY=true." >&2
+            exit 1
+          fi
+
+      - name: Notify Verity - started
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          DEPLOY_ENV: ${{ inputs.environment }}
+          DEPLOY_BACKEND: ${{ inputs.deploy_backend }}
+          DEPLOY_FRONTEND: ${{ inputs.deploy_frontend }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os
+          targets = []
+          if str(os.environ.get("DEPLOY_BACKEND", "")).lower() == "true":
+            targets.append("aws")
+          if str(os.environ.get("DEPLOY_FRONTEND", "")).lower() == "true":
+            targets.append("vercel")
+          payload = {
+            "event": "deployment_started",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "environment": os.environ.get("DEPLOY_ENV"),
+            "deployment_targets": targets,
+          }
+          print(json.dumps(payload))
+          PY
+            curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
+
+      - name: Determine AWS auth mode
+        id: aws_auth
+        if: ${{ inputs.deploy_backend == 'true' }}
+        env:
+          AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+        run: |
+          if [ -n "$AWS_ROLE_TO_ASSUME" ]; then
+            echo "use_oidc=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_oidc=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ inputs.deploy_backend == 'true' && steps.aws_auth.outputs.use_oidc == 'true' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Configure AWS credentials (static keys)
+        if: ${{ inputs.deploy_backend == 'true' && steps.aws_auth.outputs.use_oidc == 'false' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy backend (commands.deploy)
+        if: ${{ inputs.deploy_backend == 'true' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${{ steps.cfg.outputs.deploy_cmds }}" ]; then
+            echo "No commands.deploy configured in .verity/config.yml" >&2
+            exit 1
+          fi
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "::group::backend deploy: $cmd"
+            bash -lc "$cmd"
+            echo "::endgroup::"
+          done <<< "${{ steps.cfg.outputs.deploy_cmds }}"
+
+      - name: Install Vercel CLI
+        if: ${{ inputs.deploy_frontend == 'true' }}
+        run: npm i -g vercel@latest
+
+      - name: Vercel build + deploy
+        id: vercel
+        if: ${{ inputs.deploy_frontend == 'true' }}
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          vercel pull --yes --environment=${{ inputs.environment }} \
+            --token="$VERCEL_TOKEN" \
+            --scope="$VERCEL_ORG_ID" \
+            --project="$VERCEL_PROJECT_ID"
+          vercel build --token="$VERCEL_TOKEN"
+          url=$(vercel deploy --prebuilt --token="$VERCEL_TOKEN")
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "Deployed to: $url"
+
+      - name: Notify Verity - completed
+        if: always()
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          JOB_STATUS: ${{ job.status }}
+          DEPLOY_ENV: ${{ inputs.environment }}
+          VERCEL_URL: ${{ steps.vercel.outputs.url }}
+          DEPLOY_BACKEND: ${{ inputs.deploy_backend }}
+          DEPLOY_FRONTEND: ${{ inputs.deploy_frontend }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os
+          targets = []
+          if str(os.environ.get("DEPLOY_BACKEND", "")).lower() == "true":
+            targets.append("aws")
+          if str(os.environ.get("DEPLOY_FRONTEND", "")).lower() == "true":
+            targets.append("vercel")
+          payload = {
+            "event": "deployment_completed",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "status": os.environ.get("JOB_STATUS"),
+            "environment": os.environ.get("DEPLOY_ENV"),
+            "vercel_url": os.environ.get("VERCEL_URL") or None,
+            "deployment_targets": targets,
+          }
+          print(json.dumps(payload))
+          PY
+            curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
