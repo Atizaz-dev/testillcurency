@@ -1,0 +1,519 @@
+name: Verity Codex Use-Case Generation
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "Optional scope (e.g., 'checkout journey')"
+        required: false
+        default: ""
+      callback_url:
+        description: "Verity callback URL override (optional)"
+        required: false
+        default: ""
+      verity_project_id:
+        description: "Verity project id override (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: verity-usecase-generation-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  usecases:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Verify required secrets
+        run: |
+          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
+            echo "Missing required secret OPENAI_API_KEY" >&2
+            exit 1
+          fi
+          if [ -z "${{ secrets.VERITY_PROJECT_TOKEN }}" ]; then
+            echo "Missing required secret VERITY_PROJECT_TOKEN" >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install YAML parser
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load .verity/config.yml
+        id: cfg
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import yaml
+
+          cfg = yaml.safe_load(Path('.verity/config.yml').read_text()) or {}
+          verity = cfg.get('verity', {}) or {}
+          callback_override = os.environ.get("VERITY_CALLBACK_OVERRIDE", "").strip()
+          project_override = os.environ.get("VERITY_PROJECT_OVERRIDE", "").strip()
+          max_stories = int(verity.get('max_generated_stories', 500))
+          out = os.environ['GITHUB_OUTPUT']
+          with open(out, 'a', encoding='utf-8') as f:
+            f.write(f"project_id={project_override or str(verity.get('project_id', '')).strip()}\n")
+            f.write(f"callback_url={callback_override or str(verity.get('callback_url', '')).strip()}\n")
+            f.write(f"max_generated_stories={max_stories}\n")
+          PY
+        env:
+          VERITY_CALLBACK_OVERRIDE: ${{ inputs.callback_url }}
+          VERITY_PROJECT_OVERRIDE: ${{ inputs.verity_project_id }}
+
+      - name: Notify Verity - started
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+        run: |
+          if [ -z "$VERITY_CALLBACK_URL" ] || [ "$VERITY_CALLBACK_URL" = "https://szfu8h6spk.execute-api.us-east-1.amazonaws.com/staging/api/callbacks/github-actions" ]; then
+            echo "Skipping callback: callback URL not configured"
+            exit 0
+          fi
+          python - <<'PY' | curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @- || true
+          import json, os
+          payload = {
+            "event": "workflow_started",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+          }
+          print(json.dumps(payload))
+          PY
+
+      - name: Install ast-grep
+        continue-on-error: true
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/nicolo-ribaudo/ast-grep-setup/main/setup.sh | bash -s -- --version 0.38.1 2>/dev/null \
+            || npm install -g @ast-grep/cli 2>/dev/null \
+            || echo "ast-grep not available — using regex fallback"
+
+      - name: Extract code inventory (Pass 1)
+        run: python scripts/extract-code-inventory.py
+        continue-on-error: true
+
+      - name: Trace user flows (Pass 2-3)
+        run: python scripts/trace-flows.py
+        continue-on-error: true
+
+      - name: Mine test requirements (Pass 4)
+        run: python scripts/mine-tests.py
+        continue-on-error: true
+
+      - name: Render prompt
+        run: |
+          cat .github/codex/prompts/usecase-generation.md > codex-prompt.md
+          if [ -f "code-inventory.md" ]; then
+            echo "" >> codex-prompt.md
+            echo "## Pre-Extracted Code Inventory" >> codex-prompt.md
+            echo "" >> codex-prompt.md
+            echo "The file \`code-inventory.md\` in the repo root contains a pre-extracted inventory" >> codex-prompt.md
+            echo "of all API endpoints, frontend pages, test behaviors, UI interactions, and" >> codex-prompt.md
+            echo "frontend API calls found in this codebase. **Read it FIRST** before scanning" >> codex-prompt.md
+            echo "the code yourself. Use it to ensure you cover ALL features, not just the" >> codex-prompt.md
+            echo "obvious ones." >> codex-prompt.md
+          fi
+          if [ -n "${{ inputs.scope }}" ]; then
+            echo "" >> codex-prompt.md
+            echo "## Scope" >> codex-prompt.md
+            echo "" >> codex-prompt.md
+            echo "${{ inputs.scope }}" >> codex-prompt.md
+          fi
+
+      - name: Run Codex
+        id: run_codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          model: ${{ vars.VERITY_CODEX_MODEL != '' && vars.VERITY_CODEX_MODEL || 'gpt-5' }}
+          prompt-file: codex-prompt.md
+          output-file: codex-output.md
+          safety-strategy: drop-sudo
+          sandbox: workspace-write
+          allow-bots: true
+          allow-bot-users: ${{ vars.VERITY_CODEX_ALLOW_BOT_USERS }}
+          codex-args: '["--full-auto"]'
+
+      - name: Sync docs context (auto document mode)
+        run: python scripts/sync_repo_docs.py
+
+      - name: Capture Codex file changes
+        id: codex_files
+        run: |
+          echo "=== Files modified by Codex ==="
+          git diff --name-only || true
+          echo "=== use-cases.md line count ==="
+          wc -l docs/use-cases.md 2>/dev/null || echo "docs/use-cases.md not found"
+          echo "=== use-cases.md heading count ==="
+          grep -c "^### " docs/use-cases.md 2>/dev/null || echo "0 headings"
+          # If Codex wrote to docs/use-cases.md via sandbox overlay, the
+          # git diff might show changes but the file might still be the old one.
+          # Capture the diff content as a fallback for the parser.
+          git diff docs/use-cases.md > /tmp/use-cases-diff.patch 2>/dev/null || true
+          if [ -s /tmp/use-cases-diff.patch ]; then
+            echo "=== Diff found: extracting new content from git diff ==="
+            # Extract only the added lines (lines starting with +, but not +++)
+            git diff docs/use-cases.md | grep "^+" | grep -v "^+++" | sed 's/^+//' > /tmp/use-cases-from-diff.md
+            wc -l /tmp/use-cases-from-diff.md
+            grep -c "^### " /tmp/use-cases-from-diff.md || echo "0 headings in diff"
+          else
+            echo "=== No diff found — file on disk is the Codex version ==="
+          fi
+
+      - name: Extract generated stories
+        id: extract_stories
+        env:
+          MAX_GENERATED_STORIES: ${{ steps.cfg.outputs.max_generated_stories }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          def normalize(value: str) -> str:
+            return re.sub(r"\s+", " ", (value or "")).strip()
+
+          def infer_tags(title: str, description: str):
+            haystack = f"{title} {description}".lower()
+            mapping = [
+              ("auth", "auth"),
+              ("login", "auth"),
+              ("checkout", "checkout"),
+              ("payment", "payments"),
+              ("search", "search"),
+              ("admin", "admin"),
+              ("settings", "settings"),
+              ("deploy", "deploy"),
+              ("test", "testing")
+            ]
+            tags = []
+            for needle, tag in mapping:
+              if needle in haystack and tag not in tags:
+                tags.append(tag)
+            return tags
+
+          # Try multiple sources for the use-cases file:
+          # 1. The file on disk (if Codex wrote directly)
+          # 2. The diff-extracted version (if Codex changes are in git diff only)
+          path = Path("docs/use-cases.md")
+          text = path.read_text(encoding="utf-8") if path.exists() else ""
+          heading_count = len(re.findall(r"(?m)^\s*###\s+", text))
+          print(f"[parser] Source 1 (disk): {path} has {heading_count} headings", flush=True)
+
+          diff_path = Path("/tmp/use-cases-from-diff.md")
+          if diff_path.exists():
+            diff_text = diff_path.read_text(encoding="utf-8")
+            diff_heading_count = len(re.findall(r"(?m)^\s*###\s+", diff_text))
+            print(f"[parser] Source 2 (diff): {diff_path} has {diff_heading_count} headings", flush=True)
+            if diff_heading_count > heading_count:
+              print(f"[parser] Using diff version ({diff_heading_count} > {heading_count})", flush=True)
+              text = diff_text
+
+          # ── Parse stories from markdown ──
+          # Each story starts with ### and contains Description, Related Files, etc.
+          # Sub-headings like **Related Files:** are NOT separate stories.
+          stories = []
+          sections = re.split(r"(?m)^###\s+", text)
+          print(f"[parser] Total ### sections found: {len(sections) - 1}", flush=True)
+
+          skipped_non_stories = 0
+          for raw in sections[1:]:
+            lines = raw.splitlines()
+            if not lines:
+              continue
+            title = normalize(lines[0]).strip("[]")
+
+            # Skip section if it looks like a sub-heading, not a story
+            # Real stories have Description or Acceptance Criteria in their body
+            body_text = "\n".join(lines[1:])
+            is_real_story = any(marker in body_text for marker in
+              ["**Description:**", "Description:", "Acceptance Criteria",
+               "Given ", "Positive:", "Negative:", "As a ", "As an "])
+            if not is_real_story:
+              skipped_non_stories += 1
+              continue
+
+            body_lines = [line.rstrip() for line in lines[1:]]
+            description_parts = []
+            criteria = []
+            in_criteria = False
+            priority = "medium"
+            tags_from_story = []
+            related_files = []
+            upstream = ""
+            downstream = ""
+            in_related_files = False
+            for line in body_lines:
+              stripped = line.strip()
+              if not stripped:
+                continue
+
+              # Extract priority from "**Priority:** high"
+              priority_match = re.match(r"\*?\*?Priority:?\*?\*?\s*(\w+)", stripped, re.IGNORECASE)
+              if priority_match:
+                p = priority_match.group(1).lower()
+                if p in ("high", "medium", "low"):
+                  priority = p
+                continue
+
+              # Extract tags from "**Tags:** auth, admin, security"
+              tags_match = re.match(r"\*?\*?Tags:?\*?\*?\s*(.+)", stripped, re.IGNORECASE)
+              if tags_match:
+                tags_from_story = [t.strip().lower() for t in tags_match.group(1).split(",") if t.strip()]
+                continue
+
+              # Extract file references and upstream/downstream lines
+              if stripped.startswith("**Related Files"):
+                in_related_files = True
+                continue
+              if any(stripped.startswith(prefix) for prefix in
+                ["- Frontend:", "- API:", "- API client:", "- Backend:",
+                 "- State:"]):
+                related_files.append(stripped)
+                continue
+              if in_related_files and stripped.startswith("- "):
+                related_files.append(stripped)
+                continue
+              if stripped.startswith("**Upstream"):
+                in_related_files = False
+                upstream = re.sub(r"^\*?\*?Upstream:?\*?\*?\s*", "", stripped).strip()
+                continue
+              if stripped.startswith("**Downstream"):
+                in_related_files = False
+                downstream = re.sub(r"^\*?\*?Downstream:?\*?\*?\s*", "", stripped).strip()
+                continue
+              in_related_files = False
+              # Skip already-extracted priority/tags headers
+              if any(stripped.startswith(prefix) for prefix in ["**Priority", "**Tags"]):
+                continue
+
+              markerless = normalize(re.sub(r"^(?:[-*]|\d+\.)\s*", "", stripped))
+
+              if re.match(r"(?i)^(?:acceptance criteria|positive|negative|edge|permission)", markerless):
+                in_criteria = True
+                continue
+
+              is_bullet = bool(re.match(r"^(?:[-*]|\d+\.)\s+", stripped))
+              if in_criteria and is_bullet:
+                criteria.append(markerless)
+                continue
+              if re.match(r"^\*?\*?Description:?\*?\*?", stripped):
+                desc_text = re.sub(r"^\*?\*?Description:?\*?\*?\s*", "", stripped)
+                if desc_text:
+                  description_parts.append(normalize(desc_text))
+                continue
+              if not in_criteria:
+                description_parts.append(markerless)
+
+            description = normalize(" ".join(description_parts))
+            final_tags = tags_from_story if tags_from_story else infer_tags(title, description)
+
+            if title:
+              story_obj = {
+                "title": title,
+                "description": description,
+                "acceptanceCriteria": criteria,
+                "priority": priority,
+                "tags": final_tags
+              }
+              if related_files:
+                story_obj["relatedFiles"] = related_files
+              if upstream:
+                story_obj["upstream"] = upstream
+              if downstream:
+                story_obj["downstream"] = downstream
+              stories.append(story_obj)
+
+          print(f"[parser] Real stories extracted: {len(stories)}", flush=True)
+          print(f"[parser] Non-story sections skipped: {skipped_non_stories}", flush=True)
+
+          if not stories:
+            print("[parser] WARNING: No stories from ### parsing, trying bullet fallback", flush=True)
+            for line in text.splitlines():
+              match = re.match(r"^\s*(?:[-*]|\d+[.)])\s*(As\b.+)$", line, re.IGNORECASE)
+              if not match:
+                continue
+              title = normalize(match.group(1))
+              stories.append({
+                "title": title[:180],
+                "description": title,
+                "acceptanceCriteria": [],
+                "priority": "medium",
+                "tags": infer_tags(title, title)
+              })
+
+          max_stories = int(os.environ.get("MAX_GENERATED_STORIES", 500))
+          if len(stories) >= max_stories:
+            print(f"[parser] WARNING: Hit story cap! {len(stories)} stories found, capping at {max_stories}", flush=True)
+            print(f"[parser] Consider raising max_generated_stories in .verity/config.yml", flush=True)
+          stories = stories[:max_stories]
+          print(f"[parser] Final story count: {len(stories)}", flush=True)
+
+          # Write stories to file (for artifacts + PR)
+          Path("generated-stories.json").write_text(json.dumps(stories, indent=2), encoding="utf-8")
+          stories_json_size = Path("generated-stories.json").stat().st_size
+          print(f"[parser] generated-stories.json size: {stories_json_size:,} bytes", flush=True)
+
+          # Save a copy to /tmp/ — Create PR step may reset the workspace
+          import shutil
+          shutil.copy("generated-stories.json", "/tmp/generated-stories.json")
+          print(f"[parser] Backup saved to /tmp/generated-stories.json", flush=True)
+
+          # Write count to GitHub output (small — always fits)
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as handle:
+            handle.write(f"generated_story_count={len(stories)}\n")
+
+          # Try writing stories to GitHub output (may fail if too large)
+          stories_compact = json.dumps(stories, separators=(",", ":"))
+          GITHUB_OUTPUT_LIMIT = 120_000  # ~128KB env var limit with safety margin
+          if len(stories_compact) <= GITHUB_OUTPUT_LIMIT:
+            with open(out, "a", encoding="utf-8") as handle:
+              handle.write("generated_stories<<EOF\n")
+              handle.write(stories_compact)
+              handle.write("\nEOF\n")
+            print(f"[parser] Stories fit in GitHub output ({len(stories_compact):,} chars)", flush=True)
+          else:
+            print(f"[parser] WARNING: Stories too large for GitHub output ({len(stories_compact):,} chars > {GITHUB_OUTPUT_LIMIT:,} limit)", flush=True)
+            print(f"[parser] Stories will be sent via file-based callback instead", flush=True)
+          PY
+
+      - name: Detect coverage gaps (Pass 6)
+        continue-on-error: true
+        run: |
+          python scripts/detect-gaps.py
+          # Backup to /tmp/ (Create PR step may reset workspace)
+          cp coverage-gaps.json /tmp/coverage-gaps.json 2>/dev/null || true
+
+      # IMPORTANT: Callback MUST run BEFORE Create PR.
+      # Create PR triggers GitHub webhooks that fire GitHubFunction,
+      # which can overwrite the project document and clobber the stories
+      # that the callback just saved.
+      - name: Notify Verity - completed
+        if: always()
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          JOB_STATUS: ${{ job.status }}
+          CODEX_FINAL_MESSAGE: ${{ steps.run_codex.outputs.final-message }}
+          PR_BRANCH: verity/codex-usecases-${{ github.run_id }}
+          ARTIFACT_NAME: verity-usecase-generation
+          GENERATED_STORY_COUNT: ${{ steps.extract_stories.outputs.generated_story_count }}
+        run: |
+          if [ -z "$VERITY_CALLBACK_URL" ] || [ "$VERITY_CALLBACK_URL" = "https://szfu8h6spk.execute-api.us-east-1.amazonaws.com/staging/api/callbacks/github-actions" ]; then
+            echo "Skipping callback: callback URL not configured"
+            exit 0
+          fi
+          python - <<'PY' | curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @- || true
+          import json
+          import os
+          import sys
+          from pathlib import Path as P
+
+          generated_stories = []
+          for source_path in [P("/tmp/generated-stories.json"), P("generated-stories.json")]:
+            if source_path.exists():
+              try:
+                loaded = json.loads(source_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, list) and len(loaded) > len(generated_stories):
+                  generated_stories = loaded
+                  print(f"[callback] Loaded {len(generated_stories)} stories from {source_path}", file=sys.stderr, flush=True)
+              except Exception as e:
+                print(f"[callback] WARNING: Failed to read {source_path}: {e}", file=sys.stderr, flush=True)
+
+          if not generated_stories:
+            print("[callback] WARNING: No stories found", file=sys.stderr, flush=True)
+          else:
+            for i, s in enumerate(generated_stories[:5]):
+              print(f"[callback]   {i+1}. {(s.get('title','') or '')[:60]}", file=sys.stderr, flush=True)
+            if len(generated_stories) > 5:
+              print(f"[callback]   ... and {len(generated_stories)-5} more", file=sys.stderr, flush=True)
+
+          payload = {
+            "event": "workflow_completed",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "status": os.environ.get("JOB_STATUS"),
+            "pr_number": None,
+            "pr_url": None,
+            "pr_branch": os.environ.get("PR_BRANCH") or None,
+            "pr_create_outcome": None,
+            "artifact_name": os.environ.get("ARTIFACT_NAME") or None,
+            "codex_final_message": (os.environ.get("CODEX_FINAL_MESSAGE") or "")[:20000],
+            "generated_story_count": len(generated_stories),
+            "generated_stories": generated_stories,
+          }
+
+          for gap_path in [P("/tmp/coverage-gaps.json"), P("coverage-gaps.json")]:
+            if gap_path.exists():
+              try:
+                payload["coverage_gaps"] = json.loads(gap_path.read_text(encoding="utf-8"))
+                break
+              except Exception:
+                pass
+
+          payload_json = json.dumps(payload)
+          print(f"[callback] Sending {len(generated_stories)} stories via curl ({len(payload_json):,} bytes)", file=sys.stderr, flush=True)
+          print(payload_json)
+          PY
+
+      - name: Create PR
+        id: cpr
+        continue-on-error: true
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ github.token }}
+          commit-message: "docs(verity): update use cases"
+          branch: verity/codex-usecases-${{ github.run_id }}
+          delete-branch: true
+          title: "Verity: update use cases"
+          body: |
+            Automated use case updates generated by Verity/Codex.
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            ## Codex summary
+            ${{ steps.run_codex.outputs.final-message }}
+          labels: "verity:agent,verity:docs"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verity-usecase-generation
+          path: |
+            codex-output.md
+            codex-prompt.md
+            generated-stories.json
+            code-inventory.md
+            coverage-gaps.json
+          if-no-files-found: ignore

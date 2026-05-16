@@ -1,0 +1,85 @@
+name: Verity Command Router
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  actions: write
+  issues: read
+
+jobs:
+  route:
+    if: contains(github.event.comment.body, '/codex')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install YAML parser
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load .verity/config.yml
+        id: cfg
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import os
+          from pathlib import Path
+          import yaml
+          cfg = yaml.safe_load(Path(".verity/config.yml").read_text()) or {}
+          verity = cfg.get("verity", {}) or {}
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+            f.write(f"project_id={str(verity.get('project_id','')).strip()}\n")
+            f.write(f"callback_url={str(verity.get('callback_url','')).strip()}\n")
+          PY
+
+      - name: Parse /codex request
+        id: parse
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import os
+          body = os.environ.get("COMMENT_BODY", "")
+          lower = body.lower()
+          idx = lower.find("/codex")
+          request = ""
+          if idx >= 0:
+            request = body[idx + len("/codex"):].strip()
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+            f.write("request<<EOF\n")
+            f.write(request + "\n")
+            f.write("EOF\n")
+          PY
+
+      - name: Dispatch codex-dev-cycle workflow
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const issueNumber = context.payload.issue?.number;
+            const defaultBranch = context.payload.repository?.default_branch || context.ref.replace('refs/heads/', '');
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'codex-dev-cycle.yml',
+              ref: defaultBranch,
+              inputs: {
+                issue_number: issueNumber ? String(issueNumber) : '',
+                user_request: process.env.USER_REQUEST || '',
+                callback_url: process.env.CALLBACK_URL || '',
+                verity_project_id: process.env.PROJECT_ID || ''
+              }
+            });
+        env:
+          USER_REQUEST: ${{ steps.parse.outputs.request }}
+          CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
