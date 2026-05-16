@@ -1,0 +1,192 @@
+name: Verity Post-Merge Validation
+
+on:
+  push:
+    branches:
+      - "**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verity-post-merge-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    if: ${{ github.ref_name == github.event.repository.default_branch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install YAML parser
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load Verity config
+        id: cfg
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import yaml
+
+          cfg = yaml.safe_load(Path(".verity/config.yml").read_text()) or {}
+          verity = cfg.get("verity", {}) or {}
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+            handle.write(f"project_id={str(verity.get('project_id','')).strip()}\n")
+            handle.write(f"callback_url={str(verity.get('callback_url','')).strip()}\n")
+          PY
+
+      - name: Resolve command plan
+        id: plan
+        run: |
+          python scripts/detect_repo_commands.py --merge-config > .verity/resolved_commands.json
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          resolved = json.loads(Path(".verity/resolved_commands.json").read_text())
+          has_tests = bool(
+            resolved.get("test_groups", {}).get("unit")
+            or resolved.get("test_groups", {}).get("integration")
+            or resolved.get("test_groups", {}).get("e2e")
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+            handle.write(f"has_tests={'true' if has_tests else 'false'}\n")
+          PY
+
+      - name: Fail if no tests are configured or detected
+        if: ${{ steps.plan.outputs.has_tests != 'true' }}
+        run: |
+          echo "No runnable test commands detected. Configure .verity/config.yml or repo test scripts." >&2
+          exit 1
+
+      - name: Run setup commands
+        run: |
+          python - <<'PY' > /tmp/verity-setup.txt
+          import json
+          from pathlib import Path
+          resolved = json.loads(Path(".verity/resolved_commands.json").read_text())
+          print("\n".join(resolved.get("setup", []) or []))
+          PY
+          set -euo pipefail
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "::group::setup: $cmd"
+            bash -lc "$cmd"
+            echo "::endgroup::"
+          done < /tmp/verity-setup.txt
+
+      - name: Notify Verity - started
+        if: ${{ steps.cfg.outputs.callback_url != '' && secrets.VERITY_PROJECT_TOKEN != '' }}
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json
+          import os
+          payload = {
+            "event": "workflow_started",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "branch": os.environ.get("GITHUB_REF_NAME"),
+            "phase": "started"
+          }
+          print(json.dumps(payload))
+          PY
+          curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
+
+      - name: Run merged-branch suite
+        id: suite
+        continue-on-error: true
+        run: python scripts/run_verity_suite.py --resolved .verity/resolved_commands.json --log .verity/post-merge-test-output.txt --summary .verity/post-merge-suite.json --include-build
+
+      - name: Evaluate merged-branch suite
+        id: eval
+        if: always()
+        run: python scripts/evaluate_suite_result.py .verity/post-merge-suite.json
+
+      - name: Upload validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verity-post-merge-validation
+          path: |
+            .verity/resolved_commands.json
+            .verity/post-merge-test-output.txt
+            .verity/post-merge-suite.json
+          if-no-files-found: ignore
+
+      - name: Notify Verity - completed
+        if: ${{ always() && steps.cfg.outputs.callback_url != '' && secrets.VERITY_PROJECT_TOKEN != '' }}
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          FINAL_SUCCESS: ${{ steps.eval.outputs.success }}
+          FAILURE_REASON: ${{ steps.eval.outputs.failure_reason }}
+          FAILURE_CATEGORY: ${{ steps.eval.outputs.failure_category }}
+          FAILURE_PHASE: ${{ steps.eval.outputs.phase }}
+          STOP_REASON: ${{ steps.eval.outputs.stop_reason }}
+          GROUPS_RUN: ${{ steps.eval.outputs.groups_run }}
+          GROUPS_SKIPPED: ${{ steps.eval.outputs.groups_skipped }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json
+          import os
+          payload = {
+            "event": "workflow_completed",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "status": "success" if os.environ.get("FINAL_SUCCESS") == "true" else "failure",
+            "branch": os.environ.get("GITHUB_REF_NAME"),
+            "phase": os.environ.get("FAILURE_PHASE") or None,
+            "failure_reason": os.environ.get("FAILURE_REASON") or None,
+            "failure_category": os.environ.get("FAILURE_CATEGORY") or None,
+            "stop_reason": os.environ.get("STOP_REASON") or None,
+            "groups_run": json.loads(os.environ.get("GROUPS_RUN") or "{}"),
+            "groups_skipped": json.loads(os.environ.get("GROUPS_SKIPPED") or "{}"),
+          }
+          print(json.dumps(payload))
+          PY
+          curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
+
+      - name: Fail workflow if merged branch is red
+        if: ${{ always() && steps.eval.outputs.success != 'true' }}
+        run: |
+          echo "Merged branch validation failed." >&2
+          exit 1
