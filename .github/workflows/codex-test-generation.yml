@@ -1,0 +1,262 @@
+name: Verity Codex Test Generation
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "Optional scope (e.g., frontend auth flows)"
+        required: false
+        default: ""
+      template_type:
+        description: "Test template: master (happy path), error (negative/failure), equivalence (boundary/partition)"
+        required: false
+        default: "master"
+      callback_url:
+        description: "Verity callback URL override (optional)"
+        required: false
+        default: ""
+      verity_project_id:
+        description: "Verity project id override (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: verity-test-generation-${{ github.repository }}-${{ github.ref_name }}-${{ inputs.template_type || 'master' }}
+  cancel-in-progress: false
+
+jobs:
+  generate_tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Verify required secrets
+        run: |
+          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
+            echo "Missing required secret OPENAI_API_KEY" >&2
+            exit 1
+          fi
+          if [ -z "${{ secrets.VERITY_PROJECT_TOKEN }}" ]; then
+            echo "Missing required secret VERITY_PROJECT_TOKEN" >&2
+            exit 1
+          fi
+
+      - name: Detect GitHub App write-token config
+        id: gh_write_cfg
+        env:
+          VERITY_GITHUB_APP_ID: ${{ secrets.VERITY_GITHUB_APP_ID }}
+          VERITY_GITHUB_APP_PRIVATE_KEY: ${{ secrets.VERITY_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          if [ -n "$VERITY_GITHUB_APP_ID" ] && [ -n "$VERITY_GITHUB_APP_PRIVATE_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve GitHub write token (optional GitHub App)
+        id: gh_write_token
+        if: ${{ steps.gh_write_cfg.outputs.enabled == 'true' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.VERITY_GITHUB_APP_ID }}
+          private-key: ${{ secrets.VERITY_GITHUB_APP_PRIVATE_KEY }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load .verity/config.yml
+        id: cfg
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import os
+          from pathlib import Path
+          import yaml
+          cfg = yaml.safe_load(Path(".verity/config.yml").read_text()) or {}
+          verity = cfg.get("verity", {}) or {}
+          commands = cfg.get("commands", {}) or {}
+          callback_override = os.environ.get("VERITY_CALLBACK_OVERRIDE", "").strip()
+          project_override = os.environ.get("VERITY_PROJECT_OVERRIDE", "").strip()
+
+          def norm_list(v):
+            if v is None: return []
+            if isinstance(v, list): return [str(x) for x in v if str(x).strip()]
+            if isinstance(v, str) and v.strip(): return [v.strip()]
+            return []
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+            f.write(f"project_id={project_override or str(verity.get('project_id','')).strip()}\n")
+            f.write(f"callback_url={callback_override or str(verity.get('callback_url','')).strip()}\n")
+            f.write("setup_cmds<<EOF\n" + "\n".join(norm_list(commands.get("setup"))) + "\nEOF\n")
+            f.write("test_cmds<<EOF\n" + "\n".join(norm_list(commands.get("test"))) + "\nEOF\n")
+            f.write("build_cmds<<EOF\n" + "\n".join(norm_list(commands.get("build"))) + "\nEOF\n")
+          PY
+        env:
+          VERITY_CALLBACK_OVERRIDE: ${{ inputs.callback_url }}
+          VERITY_PROJECT_OVERRIDE: ${{ inputs.verity_project_id }}
+
+      - name: Notify Verity - started
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os
+          payload = {
+            "event": "workflow_started",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}"
+          }
+          print(json.dumps(payload))
+          PY
+            curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
+
+      - name: Run setup commands
+        if: ${{ steps.cfg.outputs.setup_cmds != '' }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            bash -lc "$cmd"
+          done <<< "${{ steps.cfg.outputs.setup_cmds }}"
+
+      - name: Render prompt
+        run: |
+          cat .github/codex/prompts/test-generation.md > codex-prompt.md
+
+          TEMPLATE="${{ inputs.template_type || 'master' }}"
+          echo "" >> codex-prompt.md
+          echo "## Test Template: ${TEMPLATE}" >> codex-prompt.md
+          echo "" >> codex-prompt.md
+
+          if [ "$TEMPLATE" = "error" ]; then
+            cat >> codex-prompt.md <<'TMPL'
+          Focus EXCLUSIVELY on negative and failure-path tests:
+          - Invalid inputs (wrong types, empty strings, nulls, oversized payloads)
+          - Missing required fields and parameters
+          - Unauthorized and forbidden access attempts
+          - API error responses (400, 401, 403, 404, 500)
+          - Boundary failures (max lengths, zero values, negative numbers)
+          - Concurrent/duplicate request handling
+          - Network and timeout error scenarios
+          Do NOT generate happy-path or success-case tests — only error and failure scenarios.
+          TMPL
+          elif [ "$TEMPLATE" = "equivalence" ]; then
+            cat >> codex-prompt.md <<'TMPL'
+          Focus EXCLUSIVELY on equivalence class partitioning tests:
+          - Identify input domains and partition them into valid and invalid classes
+          - For each input field: test one representative value from each equivalence class
+          - Boundary value analysis: test at, just below, and just above boundaries
+          - Test combinations of valid/invalid classes across multiple inputs
+          - Label each test clearly with its partition (e.g., "valid-email-class", "invalid-negative-age-class")
+          - Cover: string lengths, numeric ranges, date ranges, enum values, boolean combinations
+          Do NOT generate general functional or error tests — only partition-based boundary tests.
+          TMPL
+          fi
+
+          if [ -n "${{ inputs.scope }}" ]; then
+            echo "" >> codex-prompt.md
+            echo "## Scope" >> codex-prompt.md
+            echo "" >> codex-prompt.md
+            echo "${{ inputs.scope }}" >> codex-prompt.md
+          fi
+
+      - name: Run Codex
+        id: run_codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          model: ${{ vars.VERITY_CODEX_MODEL != '' && vars.VERITY_CODEX_MODEL || 'gpt-5' }}
+          prompt-file: codex-prompt.md
+          output-file: codex-output.md
+          safety-strategy: drop-sudo
+          sandbox: workspace-write
+          allow-bots: true
+          codex-args: '["--full-auto"]'
+
+      - name: Sync docs context (auto document mode)
+        run: python scripts/sync_repo_docs.py
+
+      - name: Run tests/build
+        if: ${{ steps.cfg.outputs.test_cmds != '' }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            bash -lc "$cmd"
+          done <<< "${{ steps.cfg.outputs.test_cmds }}"
+          if [ -n "${{ steps.cfg.outputs.build_cmds }}" ]; then
+            while IFS= read -r cmd; do
+              [ -z "$cmd" ] && continue
+              bash -lc "$cmd"
+            done <<< "${{ steps.cfg.outputs.build_cmds }}"
+          fi
+
+      - name: Create PR
+        id: cpr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ steps.gh_write_token.outputs.token || secrets.VERITY_GITHUB_WRITE_TOKEN || github.token }}
+          commit-message: "test(verity): add/update tests (${{ inputs.template_type || 'master' }})"
+          branch: verity/codex-test-generation-${{ inputs.template_type || 'master' }}-${{ github.run_id }}
+          delete-branch: true
+          title: "Verity: test generation (${{ inputs.template_type || 'master' }})"
+          body: |
+            Automated test updates generated by Verity/Codex.
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            ## Codex summary
+            ${{ steps.run_codex.outputs.final-message }}
+          labels: "verity:agent,verity:tests"
+
+      - name: Notify Verity - completed
+        if: always()
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          JOB_STATUS: ${{ job.status }}
+          PR_NUMBER: ${{ steps.cpr.outputs.pull-request-number }}
+          PR_URL: ${{ steps.cpr.outputs.pull-request-url }}
+        run: |
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os
+          payload = {
+            "event": "workflow_completed",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "status": os.environ.get("JOB_STATUS"),
+            "pr_number": os.environ.get("PR_NUMBER") or None,
+            "pr_url": os.environ.get("PR_URL") or None
+          }
+          print(json.dumps(payload))
+          PY
+            curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
