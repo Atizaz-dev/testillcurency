@@ -1,0 +1,308 @@
+name: Verity Codex PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review"
+        required: false
+        default: ""
+      pr_head_sha:
+        description: "PR head SHA expected by Verity"
+        required: false
+        default: ""
+      callback_url:
+        description: "Verity callback URL override (optional)"
+        required: false
+        default: ""
+      verity_project_id:
+        description: "Verity project id override (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: verity-pr-review-${{ github.repository }}-${{ github.event.pull_request.number || inputs.pr_number || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  codex_review:
+    if: ${{ github.event_name == 'workflow_dispatch' || (!github.event.pull_request.draft && contains(join(github.event.pull_request.labels.*.name, ','), 'verity:agent')) }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve PR number
+        id: pr
+        run: |
+          PR_FROM_EVENT="${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}"
+          PR_FROM_INPUT="${{ inputs.pr_number }}"
+          PR_NUMBER="${PR_FROM_INPUT:-$PR_FROM_EVENT}"
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head_sha=${{ inputs.pr_head_sha || github.event.pull_request.head.sha || '' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR merge ref
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.pr.outputs.number != '' && format('refs/pull/{0}/merge', steps.pr.outputs.number) || github.ref }}
+          fetch-depth: 0
+
+      - name: Verify required secrets
+        run: |
+          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
+            echo "Missing required secret OPENAI_API_KEY" >&2
+            exit 1
+          fi
+          if [ -z "${{ secrets.VERITY_PROJECT_TOKEN }}" ]; then
+            echo "Missing required secret VERITY_PROJECT_TOKEN" >&2
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install YAML parser
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Load .verity/config.yml
+        id: cfg
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import yaml
+          cfg = yaml.safe_load(Path(".verity/config.yml").read_text()) or {}
+          verity = cfg.get("verity", {}) or {}
+          policies = cfg.get("policies", {}) or {}
+          callback_override = os.environ.get("VERITY_CALLBACK_OVERRIDE", "").strip()
+          project_override = os.environ.get("VERITY_PROJECT_OVERRIDE", "").strip()
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+            f.write(f"project_id={project_override or str(verity.get('project_id','')).strip()}\n")
+            f.write(f"callback_url={callback_override or str(verity.get('callback_url','')).strip()}\n")
+            f.write(f"pr_review_label={str((policies.get('pr_review', {}) or {}).get('label_required','verity:agent')).strip()}\n")
+          PY
+        env:
+          VERITY_CALLBACK_OVERRIDE: ${{ inputs.callback_url }}
+          VERITY_PROJECT_OVERRIDE: ${{ inputs.verity_project_id }}
+
+      - name: Enforce label gate for direct PR events
+        if: ${{ github.event_name == 'pull_request' && steps.pr.outputs.number != '' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const issue_number = Number(process.env.PR_NUMBER);
+            const requiredLabel = process.env.REQUIRED_LABEL || 'verity:agent';
+            const { data } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: issue_number
+            });
+            const labels = (data.labels || []).map((l) => l.name || '');
+            if (!labels.includes(requiredLabel)) {
+              core.setFailed(`Label gate failed: PR must include label ${requiredLabel}`);
+            }
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REQUIRED_LABEL: ${{ steps.cfg.outputs.pr_review_label }}
+
+      - name: Notify Verity - started
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          if [ -z "$VERITY_CALLBACK_URL" ] || [ "$VERITY_CALLBACK_URL" = "https://szfu8h6spk.execute-api.us-east-1.amazonaws.com/staging/api/callbacks/github-actions" ]; then
+            echo "Skipping callback: callback URL not configured"
+            exit 0
+          fi
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os
+          payload = {
+            "event": "workflow_started",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "pr_number": os.environ.get("PR_NUMBER") or None,
+            "pr_head_sha": os.environ.get("PR_HEAD_SHA") or None
+          }
+          print(json.dumps(payload))
+          PY
+          curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
+
+      - name: Run Codex review (read-only)
+        id: run_codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/codex/prompts/pr-review.md
+          output-file: codex-review.md
+          safety-strategy: drop-sudo
+          sandbox: read-only
+
+      - name: Parse review decision
+        id: review_parse
+        if: ${{ steps.run_codex.outputs.final-message != '' }}
+        env:
+          CODEX_FINAL_MESSAGE: ${{ steps.run_codex.outputs.final-message }}
+        run: |
+          python - <<'PY'
+          import os, re
+          message = os.environ.get("CODEX_FINAL_MESSAGE", "")
+
+          explicit_decision = None
+          explicit_match = re.search(r"^\s*VERITY_REVIEW_DECISION:\s*(approved|needs_changes)\s*$", message, re.I | re.M)
+          if explicit_match:
+            explicit_decision = explicit_match.group(1).lower()
+
+          explicit_count = None
+          count_match = re.search(r"^\s*VERITY_MUST_FIX_COUNT:\s*(\d+)\s*$", message, re.I | re.M)
+          if count_match:
+            explicit_count = int(count_match.group(1))
+
+          must_fix_items = []
+          list_match = re.search(r"^\s*VERITY_MUST_FIX_ITEMS:\s*(.+)$", message, re.I | re.M)
+          if list_match:
+            must_fix_items = [chunk.strip() for chunk in re.split(r"[|;]", list_match.group(1)) if chunk.strip()]
+          else:
+            section_match = re.search(r"Must[- ]fix([\s\S]*?)(?:\n\s*(?:Suggestions|Testing notes|What's good)\s*:|$)", message, re.I)
+            if section_match:
+              for raw_line in section_match.group(1).splitlines():
+                line = raw_line.strip()
+                if re.match(r"^[-*]\s+|^\d+\.\s+", line):
+                  must_fix_items.append(re.sub(r"^[-*]\s+|^\d+\.\s+", "", line).strip())
+
+          must_fix_count = explicit_count if explicit_count is not None else len(must_fix_items)
+          decision = explicit_decision if explicit_decision in ("approved", "needs_changes") else ("needs_changes" if must_fix_count > 0 else "approved")
+          summary = " | ".join(must_fix_items[:5])[:2000]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+            handle.write(f"decision={decision}\n")
+            handle.write(f"must_fix_count={must_fix_count}\n")
+            handle.write(f"must_fix_summary={summary}\n")
+          PY
+
+      - name: Post review comment
+        id: review_comment
+        if: ${{ steps.run_codex.outputs.final-message != '' && steps.pr.outputs.number != '' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const response = await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+              body: process.env.CODEX_FINAL_MESSAGE,
+            });
+            core.setOutput('review_url', response.data.html_url || '');
+            core.setOutput('review_comment_id', String(response.data.id || ''));
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          CODEX_FINAL_MESSAGE: ${{ steps.run_codex.outputs.final-message }}
+
+      - name: Post inline review comments
+        if: ${{ steps.run_codex.outputs.final-message != '' && steps.pr.outputs.number != '' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const message = process.env.CODEX_FINAL_MESSAGE || '';
+            const comments = [];
+            for (const rawLine of message.split(/\r?\n/)) {
+              const match = rawLine.match(/^VERITY_INLINE_COMMENT:\s*([^|]+)\|(\d+)\|(.*)$/i);
+              if (!match) continue;
+              const path = match[1].trim();
+              const line = Number(match[2]);
+              const body = match[3].trim();
+              if (!path || !Number.isFinite(line) || line <= 0 || !body) continue;
+              comments.push({ path, line, side: 'RIGHT', body });
+            }
+            if (comments.length === 0) {
+              core.info('No structured inline comments emitted by Verity review.');
+              return;
+            }
+            try {
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: Number(process.env.PR_NUMBER),
+                event: 'COMMENT',
+                body: 'Verity inline review findings',
+                comments: comments.slice(0, 25)
+              });
+            } catch (error) {
+              core.warning(`Unable to post inline review comments: ${error.message}`);
+            }
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          CODEX_FINAL_MESSAGE: ${{ steps.run_codex.outputs.final-message }}
+
+      - name: Notify Verity
+        if: always()
+        continue-on-error: true
+        env:
+          VERITY_PROJECT_TOKEN: ${{ secrets.VERITY_PROJECT_TOKEN }}
+          VERITY_PROJECT_ID: ${{ steps.cfg.outputs.project_id }}
+          VERITY_CALLBACK_URL: ${{ steps.cfg.outputs.callback_url }}
+          JOB_STATUS: ${{ job.status }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_URL: ${{ github.server_url }}/${{ github.repository }}/pull/${{ steps.pr.outputs.number }}
+          REVIEW_URL: ${{ steps.review_comment.outputs.review_url }}
+          REVIEW_COMMENT_ID: ${{ steps.review_comment.outputs.review_comment_id }}
+          REVIEW_DECISION: ${{ steps.review_parse.outputs.decision }}
+          MUST_FIX_COUNT: ${{ steps.review_parse.outputs.must_fix_count }}
+          MUST_FIX_SUMMARY: ${{ steps.review_parse.outputs.must_fix_summary }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          CODEX_FINAL_MESSAGE: ${{ steps.run_codex.outputs.final-message }}
+        run: |
+          if [ -z "$VERITY_CALLBACK_URL" ] || [ "$VERITY_CALLBACK_URL" = "https://szfu8h6spk.execute-api.us-east-1.amazonaws.com/staging/api/callbacks/github-actions" ]; then
+            echo "Skipping callback: callback URL not configured"
+            exit 0
+          fi
+          python - <<'PY' > /tmp/verity-callback.json
+          import json, os
+          payload = {
+            "event": "workflow_completed",
+            "project_id": os.environ.get("VERITY_PROJECT_ID"),
+            "repo": os.environ.get("GITHUB_REPOSITORY"),
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+            "status": os.environ.get("JOB_STATUS"),
+            "pr_number": os.environ.get("PR_NUMBER"),
+            "pr_head_sha": os.environ.get("PR_HEAD_SHA") or None,
+            "pr_url": os.environ.get("PR_URL"),
+            "review_url": os.environ.get("REVIEW_URL") or None,
+            "review_comment_id": os.environ.get("REVIEW_COMMENT_ID") or None,
+            "review_decision": os.environ.get("REVIEW_DECISION") or None,
+            "must_fix_count": os.environ.get("MUST_FIX_COUNT") or None,
+            "must_fix_summary": os.environ.get("MUST_FIX_SUMMARY") or None,
+            "pr_base_ref": os.environ.get("PR_BASE_REF") or None,
+            "codex_final_message": (os.environ.get("CODEX_FINAL_MESSAGE") or "")[:20000],
+          }
+          print(json.dumps(payload))
+          PY
+          curl -sS -X POST "$VERITY_CALLBACK_URL" \
+            -H "Authorization: Bearer $VERITY_PROJECT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/verity-callback.json || true
