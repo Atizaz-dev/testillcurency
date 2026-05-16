@@ -1,0 +1,43 @@
+version: 1
+verity:
+  project_id: "4eed32cc-56ab-4d04-97c4-58a0d71326da"
+  callback_url: "https://szfu8h6spk.execute-api.us-east-1.amazonaws.com/staging/api/callbacks/github-actions"
+  bootstrap_version: "v2"
+  max_generated_stories: 500
+
+commands:
+  setup: []
+  test: []
+  build: []
+  deploy: []
+  test_groups:
+    unit: []
+    integration: []
+    e2e: []
+
+automation:
+  test_auto_fix:
+    enabled: true
+    max_attempts: 3
+    post_merge_validation: true
+    pr_triggers:
+      - "opened"
+      - "synchronize"
+      - "reopened"
+  e2e:
+    enabled: "auto"
+    command: []
+    start_command: ""
+    base_url: ""
+    base_url_env: "PLAYWRIGHT_BASE_URL"
+    required_env: []
+
+policies:
+  pr_review:
+    enabled: true
+    label_required: "verity:agent"
+  openai_guardrail:
+    enabled: true
+  documentation:
+    auto_mode: true
+    handoff_file: "docs/AI_HANDOFF.md"
