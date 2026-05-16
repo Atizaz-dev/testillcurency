@@ -1,0 +1,69 @@
+name: Verity Auto Docs
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_draft:
+        description: "Create docs sync PR as draft (true/false)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync_docs:
+    if: ${{ github.event_name == 'workflow_dispatch' || !startsWith(github.head_ref, 'verity/bootstrap-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install YAML parser
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Sync docs
+        run: python scripts/sync_repo_docs.py
+
+      - name: Detect docs changes
+        id: diff
+        run: |
+          if git diff --quiet -- docs/REPO_CONTEXT.md docs/AI_HANDOFF.md; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fail PR when docs are stale
+        if: ${{ github.event_name == 'pull_request' && steps.diff.outputs.changed == 'true' }}
+        run: |
+          echo "Documentation is out of date for this PR." >&2
+          echo "Run: python scripts/sync_repo_docs.py" >&2
+          git --no-pager diff -- docs/REPO_CONTEXT.md docs/AI_HANDOFF.md || true
+          exit 1
+
+      - name: Create docs sync PR (manual mode)
+        if: ${{ github.event_name == 'workflow_dispatch' && steps.diff.outputs.changed == 'true' }}
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ github.token }}
+          commit-message: "docs(verity): sync repo context and handoff"
+          branch: verity/auto-docs-${{ github.run_id }}
+          delete-branch: true
+          title: "Verity: sync repository docs context"
+          body: |
+            Automated documentation sync for onboarding context.
+
+            - Updated by: `scripts/sync_repo_docs.py`
+            - Workflow run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          labels: "verity:agent,verity:docs"
+          draft: ${{ inputs.pr_draft == 'true' }}
