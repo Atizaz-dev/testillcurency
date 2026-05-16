@@ -4,9 +4,9 @@
   "version": "1.0.0",
   "description": "Garment mockup studio with accounts and subscription",
   "scripts": {
-    "start": "node server.js",
+    "start": "node api.js && node server.js",
     "start:clean": "kill-port 3000 && node server.js",
-    "dev": "node server.js"
+    "dev": "node api.js && node server.js"
   },
   "engines": {
     "node": ">=18"
